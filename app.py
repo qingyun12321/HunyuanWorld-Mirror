@@ -8,6 +8,12 @@ import sys
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CKPTS_DIR = os.path.join(PROJECT_ROOT, "ckpts")
+LOCAL_MODEL_DIR = CKPTS_DIR
+SKYSEG_ONNX_PATH = os.path.join(CKPTS_DIR, "skyseg.onnx")
+os.makedirs(CKPTS_DIR, exist_ok=True)
+
 import cv2
 import gradio as gr
 import numpy as np
@@ -101,7 +107,28 @@ def run_model(
 
     # Initialize model if not already done
     if model is None:
-        model = WorldMirror.from_pretrained("tencent/HunyuanWorld-Mirror").to(device)
+        required_model_files = ["config.json", "model.safetensors"]
+        missing_model_files = [
+            filename
+            for filename in required_model_files
+            if not os.path.exists(os.path.join(LOCAL_MODEL_DIR, filename))
+        ]
+        if missing_model_files:
+            print(
+                "Local pretrained model files are missing in "
+                f"'{LOCAL_MODEL_DIR}': {missing_model_files}. "
+                "Downloading model files to local ckpts directory..."
+            )
+            from huggingface_hub import snapshot_download
+
+            snapshot_download(
+                repo_id="tencent/HunyuanWorld-Mirror",
+                local_dir=LOCAL_MODEL_DIR,
+                local_dir_use_symlinks=False,
+                allow_patterns=required_model_files,
+            )
+        print(f"Loading local pretrained model from: {LOCAL_MODEL_DIR}")
+        model = WorldMirror.from_pretrained(LOCAL_MODEL_DIR).to(device)
     else:
         model.to(device)
     
@@ -153,12 +180,13 @@ def run_model(
     pts3d_conf = depth_conf              # S H W
 
     # sky mask segmentation
-    if not os.path.exists("skyseg.onnx"):
-        print("Downloading skyseg.onnx...")
+    if not os.path.exists(SKYSEG_ONNX_PATH):
+        print(f"Downloading skyseg.onnx to {SKYSEG_ONNX_PATH} ...")
         download_file_from_url(
-            "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx", "skyseg.onnx"
+            "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx",
+            SKYSEG_ONNX_PATH,
         )
-    skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
+    skyseg_session = onnxruntime.InferenceSession(SKYSEG_ONNX_PATH)
     sky_mask_list = []
     for i, img_path in enumerate([os.path.join(image_folder_path, path) for path in os.listdir(image_folder_path)]):
         sky_mask = segment_sky(img_path, skyseg_session)
@@ -1814,7 +1842,7 @@ with gr.Blocks(
     demo.queue().launch(
         show_error=True,
         share=False,
-        server_name="127.0.0.1",
-        server_port=8080,
+        server_name="0.0.0.0",
+        server_port=10085,
         ssr_mode=False,
     )
