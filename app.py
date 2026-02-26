@@ -1455,45 +1455,19 @@ with gr.Blocks(
     """
 ) as demo:
     # State variables for the tabbed interface
-    is_example = gr.Textbox(label="is_example", visible=False, value="None")
-    num_images = gr.Textbox(label="num_images", visible=False, value="None")
+    is_example = gr.Textbox(label="is_example", visible=False, value="False")
     processed_data_state = gr.State(value=None)
-    current_view_index = gr.State(value=0)  # Track current view index for navigation
 
-    # Header and description
+    # Header
     gr.HTML(
-    """
-    <div style="text-align: center;">
-    <h1>
-        <span style="background: linear-gradient(90deg, #3b82f6, #1e40af); -webkit-background-clip: text; background-clip: text; color: transparent; font-weight: bold;">WorldMirror:</span> 
-        <span style="color: #555555;">Universal 3D World Reconstruction with Any Prior Prompting</span>
-    </h1>
-    <p>
-    <a href="https://arxiv.org/abs/2510.10726">📄 ArXiv Paper</a> |
-    <a href="https://3d-models.hunyuan.tencent.com/world/">🌐 Project Page</a> |
-    <a href="https://github.com/Tencent-Hunyuan/HunyuanWorld-Mirror">💻 GitHub Repository</a> | 
-    <a href="https://huggingface.co/tencent/HunyuanWorld-Mirror">🤗 Hugging Face Model</a>
-    </p>
-    </div>
-    <div style="font-size: 16px; line-height: 1.5;">
-        <p>WorldMirror supports any combination of inputs (images, intrinsics, poses, and depth) and multiple outputs including point clouds, camera parameters, depth maps, normal maps, and 3D Gaussian Splatting (3DGS). </p>
-    <h3>How to Use:</h3>
-    <ol>
-        <li><strong>Upload Your Data:</strong> Click the "Upload Video or Images" button to add your files. Videos are automatically extracted into frames at one-second intervals.</li>
-        <li><strong>Reconstruct:</strong> Click the "Reconstruct" button to start the 3D reconstruction.</li>
-            <li><strong>Visualize:</strong> Explore multiple reconstruction results across different tabs:
-                <ul>
-                    <li><strong>3D View:</strong> Interactive point cloud/mesh visualization with camera poses (downloadable as GLB)</li>
-                    <li><strong>3D Gaussian Splatting:</strong> Interactive 3D Gaussian Splatting visualization with RGB and depth videos (downloadable as PLY)</li>
-                    <li><strong>Depth Maps:</strong> Per-view depth estimation results (downloadable as PNG)</li>
-                    <li><strong>Normal Maps:</strong> Per-view surface orientation visualization (downloadable as PNG)</li>
-                    <li><strong>Camera Parameters:</strong> Estimated camera poses and intrinsics (downloadable as JSON)</li>
-                </ul>
-            </li>
-    </ol>
-    <p><strong style="color: #3b82f6;">Please note: Loading data and displaying 3D effects may take a moment. For faster performance, we recommend downloading the code from our GitHub and running it locally.</strong></p>
-    </div>
-    """)
+        """
+        <div style="text-align: center; margin-bottom: 6px;">
+            <h1 style="margin: 0; font-size: 42px; letter-spacing: 0.5px;">
+                <span style="background: linear-gradient(90deg, #3b82f6, #1e40af); -webkit-background-clip: text; background-clip: text; color: transparent; font-weight: 700;">Kokoni</span>
+            </h1>
+        </div>
+        """
+    )
 
     output_path_state = gr.Textbox(label="Output Path", visible=False, value="None")
 
@@ -1672,134 +1646,6 @@ with gr.Blocks(
                 filter_ambiguous = gr.Checkbox(label="Filter low confidence & depth/normal edges", value=True)
                 filter_sky_bg = gr.Checkbox(label="Filter Sky Background", value=False)
 
-        with gr.Column(scale=1):            
-            gr.Markdown("### Click to load example scenes")
-            realworld_scenes = extract_example_scenes_metadata("examples/realistic") if os.path.exists("examples/realistic") else extract_example_scenes_metadata("examples")
-            generated_scenes = extract_example_scenes_metadata("examples/stylistic") if os.path.exists("examples/stylistic") else []
-            
-            # If no subdirectories exist, fall back to single gallery
-            if not os.path.exists("examples/realistic") and not os.path.exists("examples/stylistic"):
-                # Fallback: use all scenes from examples directory
-                all_scenes = extract_example_scenes_metadata("examples")
-                if all_scenes:
-                    gallery_items = [
-                        (scene["thumbnail"], f"{scene['name']}\n📷 {scene['num_images']} images")
-                        for scene in all_scenes
-                    ]
-                    
-                    example_gallery = gr.Gallery(
-                        value=gallery_items,
-                        label="Example Scenes",
-                        columns=1,
-                        rows=None,
-                        height=800,
-                        object_fit="contain",
-                        show_label=False,
-                        interactive=True,
-                        preview=False,
-                        allow_preview=False,
-                        elem_classes=["example-gallery"]
-                    )
-                    
-                    def handle_example_selection(evt: gr.SelectData):
-                        if evt:
-                            result = load_example_scenes(all_scenes[evt.index]["name"], all_scenes)
-                            return result
-                        return (None, None, None, None, "No scene selected")
-                    
-                    example_gallery.select(
-                        fn=handle_example_selection,
-                        outputs=[
-                            reconstruction_output,
-                            gs_output,
-                            output_path_state,
-                            image_gallery,
-                            log_output,
-                        ],
-                    )
-            else:
-                # Tabbed interface for categorized examples
-                with gr.Tabs():
-                    with gr.Tab("🌍 Realistic Cases"):
-                        if realworld_scenes:
-                            realworld_items = [
-                                (scene["thumbnail"], f"{scene['name']}\n📷 {scene['num_images']} images")
-                                for scene in realworld_scenes
-                            ]
-                            
-                            realworld_gallery = gr.Gallery(
-                                value=realworld_items,
-                                label="Real-world Examples",
-                                columns=1,
-                                rows=None,
-                                height=750,
-                                object_fit="contain",
-                                show_label=False,
-                                interactive=True,
-                                preview=False,
-                                allow_preview=False,
-                                elem_classes=["example-gallery"]
-                            )
-                            
-                            def handle_realworld_selection(evt: gr.SelectData):
-                                if evt:
-                                    result = load_example_scenes(realworld_scenes[evt.index]["name"], realworld_scenes)
-                                    return result
-                                return (None, None, None, None, "No scene selected")
-                            
-                            realworld_gallery.select(
-                                fn=handle_realworld_selection,
-                                outputs=[
-                                    reconstruction_output,
-                                    gs_output,
-                                    output_path_state,
-                                    image_gallery,
-                                    log_output,
-                                ],
-                            )
-                        else:
-                            gr.Markdown("No real-world examples available")
-                    
-                    with gr.Tab("🎨 Stylistic Cases"):
-                        if generated_scenes:
-                            generated_items = [
-                                (scene["thumbnail"], f"{scene['name']}\n📷 {scene['num_images']} images")
-                                for scene in generated_scenes
-                            ]
-                            
-                            generated_gallery = gr.Gallery(
-                                value=generated_items,
-                                label="Generated Examples",
-                                columns=1,
-                                rows=None,
-                                height=750,
-                                object_fit="contain",
-                                show_label=False,
-                                interactive=True,
-                                preview=False,
-                                allow_preview=False,
-                                elem_classes=["example-gallery"]
-                            )
-                            
-                            def handle_generated_selection(evt: gr.SelectData):
-                                if evt:
-                                    result = load_example_scenes(generated_scenes[evt.index]["name"], generated_scenes)
-                                    return result
-                                return (None, None, None, None, "No scene selected")
-                            
-                            generated_gallery.select(
-                                fn=handle_generated_selection,
-                                outputs=[
-                                    reconstruction_output,
-                                    gs_output,
-                                    output_path_state,
-                                    image_gallery,
-                                    log_output,
-                                ],
-                            )
-                        else:
-                            gr.Markdown("No generated examples available")
-    
     # -------------------------------------------------------------------------
     # Click logic
     # -------------------------------------------------------------------------
@@ -2293,14 +2139,6 @@ with gr.Blocks(
         outputs=[terminal_output]
     )
     
-    gr.HTML("""
-    <hr style="margin-top: 40px; margin-bottom: 20px;">
-    <div style="text-align: center; font-size: 14px; color: #666; margin-bottom: 20px;">
-        <h3>Acknowledgements</h3>
-        <p>🔗 <a href="https://github.com/microsoft/MoGe">MoGe2 on HuggingFace</a> | 🔗 <a href="https://github.com/facebookresearch/vggt">VGGT on HuggingFace</a></p>
-    </div>
-    """)
-
 class PlatformClientPayload(BaseModel):
     client_id: str
 
