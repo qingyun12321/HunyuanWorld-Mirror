@@ -26,6 +26,7 @@ import spaces
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pillow_heif import register_heif_opener
 from pydantic import BaseModel
@@ -123,11 +124,14 @@ class PlatformTaskManager:
         self.heartbeat_timeout_sec = _env_int("PLATFORM_HEARTBEAT_TIMEOUT_SEC", 90)
         self.monitor_interval_sec = _env_int("PLATFORM_MONITOR_INTERVAL_SEC", 5)
         self.status_check_interval_sec = _env_int("PLATFORM_STATUS_CHECK_INTERVAL_SEC", 30)
+        self.idle_pause_grace_sec = _env_int("PLATFORM_IDLE_PAUSE_GRACE_SEC", 120)
 
         self.enabled = bool(self.task_id and self.token)
         self._lock = threading.Lock()
         self._active_clients: dict[str, float] = {}
         self._task_running = False
+        self._last_recover_ts = 0.0
+        self._last_client_activity_ts = 0.0
         self._last_status_check_ts = 0.0
         self._monitor_stop = threading.Event()
         self._monitor_thread: threading.Thread | None = None
@@ -153,7 +157,13 @@ class PlatformTaskManager:
             f"heartbeat={self.heartbeat_interval_sec}s/{self.heartbeat_timeout_sec}s"
         )
         try:
-            self.sync_task_state()
+            runtime = self.sync_task_state()
+            if runtime.get("task_running"):
+                with self._lock:
+                    self._last_recover_ts = time.time()
+                    self._last_client_activity_ts = max(
+                        self._last_client_activity_ts, self._last_recover_ts
+                    )
         except Exception as exc:
             print(f"[platform] initial state sync failed: {exc}")
 
@@ -409,8 +419,11 @@ class PlatformTaskManager:
             else:
                 raise
 
+        now = time.time()
         with self._lock:
             self._task_running = True
+            self._last_recover_ts = now
+            self._last_client_activity_ts = max(self._last_client_activity_ts, now)
         return payload
 
     def pause_task(self) -> dict:
@@ -454,6 +467,7 @@ class PlatformTaskManager:
             "task_running_cached": self._task_running,
             "heartbeat_interval_ms": self.heartbeat_interval_ms,
             "heartbeat_timeout_sec": self.heartbeat_timeout_sec,
+            "idle_pause_grace_sec": self.idle_pause_grace_sec,
         }
 
     def sync_task_state(self) -> dict:
@@ -465,8 +479,13 @@ class PlatformTaskManager:
         service_base_url = self._extract_service_base_url(detail)
         running = self._is_running_status(status)
 
+        now = time.time()
         with self._lock:
+            was_running = self._task_running
             self._task_running = running
+            if running and not was_running:
+                self._last_recover_ts = now
+                self._last_client_activity_ts = max(self._last_client_activity_ts, now)
 
         active_clients = self._active_client_count()
         if active_clients > 0 and not running:
@@ -486,6 +505,7 @@ class PlatformTaskManager:
             self._prune_stale_clients_locked(now)
             was_idle = len(self._active_clients) == 0
             self._active_clients[client_id] = now
+            self._last_client_activity_ts = now
         if was_idle:
             self.recover_task()
         return self.status_snapshot()
@@ -496,6 +516,7 @@ class PlatformTaskManager:
         with self._lock:
             self._active_clients[client_id] = now
             self._prune_stale_clients_locked(now)
+            self._last_client_activity_ts = now
             if (now - self._last_status_check_ts) >= self.status_check_interval_sec:
                 self._last_status_check_ts = now
                 should_sync = True
@@ -522,7 +543,13 @@ class PlatformTaskManager:
             try:
                 active_count = self._active_client_count()
                 if active_count == 0:
-                    if self._task_running:
+                    now = time.time()
+                    should_pause = False
+                    with self._lock:
+                        idle_ref = max(self._last_recover_ts, self._last_client_activity_ts)
+                        idle_sec = now - idle_ref if idle_ref > 0 else now
+                        should_pause = self._task_running and idle_sec >= self.idle_pause_grace_sec
+                    if should_pause:
                         self.pause_task()
                     continue
 
@@ -2154,6 +2181,13 @@ def _validate_client_id(client_id: str) -> str:
 
 def create_fastapi_app(gradio_blocks: gr.Blocks, task_manager: PlatformTaskManager) -> FastAPI:
     api = FastAPI(title="HunyuanWorld-Mirror Service", version="1.0.0")
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @api.get("/health")
     def health_check():
