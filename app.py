@@ -1,10 +1,14 @@
 import gc
+import json
 import os
+import re
 import shutil
+import threading
 import time
 from datetime import datetime
 import io
 import sys
+from urllib.parse import quote_plus
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -17,10 +21,14 @@ os.makedirs(CKPTS_DIR, exist_ok=True)
 import cv2
 import gradio as gr
 import numpy as np
+import requests
 import spaces
 import torch
+import uvicorn
+from fastapi import FastAPI, HTTPException
 from PIL import Image
 from pillow_heif import register_heif_opener
+from pydantic import BaseModel
 register_heif_opener()
 
 from src.utils.inference_utils import load_and_preprocess_images
@@ -77,6 +85,459 @@ class TeeOutput:
         global current_terminal_output
         self.log = io.StringIO()
         current_terminal_output = ""
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+class PlatformTaskManager:
+    """Manage task lifecycle against Suanli OpenAPI based on browser presence."""
+
+    _RECOVER_ALREADY_RUNNING_PATTERN = re.compile(
+        r"already|running|active|运行中|已运行|无需恢复|未暂停|must.*paused|任务必须为暂停中",
+        re.IGNORECASE,
+    )
+    _PAUSE_ALREADY_PAUSED_PATTERN = re.compile(
+        r"already|paused|inactive|stopped|已暂停|无需暂停|must.*running|任务必须为运行中",
+        re.IGNORECASE,
+    )
+
+    def __init__(self) -> None:
+        self.openapi_base = os.getenv("PLATFORM_OPENAPI_BASE", "https://openapi.suanli.cn").rstrip("/")
+        self.api_version = os.getenv("PLATFORM_API_VERSION", "1.0.0").strip() or "1.0.0"
+        # Use env vars first; fallback to current deployment values for quick setup.
+        self.task_id = (os.getenv("PLATFORM_TASK_ID") or "1321324").strip()
+        self.service_port = _env_int("PLATFORM_SERVICE_PORT", 10085)
+        self.token = (
+            os.getenv("PLATFORM_TOKEN")
+            or "f2ee1c4c-b678-4b3e-850b-e56a6f57bfd3-20260208093806"
+        ).strip()
+        self.heartbeat_interval_sec = _env_int("PLATFORM_HEARTBEAT_INTERVAL_SEC", 20)
+        self.heartbeat_timeout_sec = _env_int("PLATFORM_HEARTBEAT_TIMEOUT_SEC", 90)
+        self.monitor_interval_sec = _env_int("PLATFORM_MONITOR_INTERVAL_SEC", 5)
+        self.status_check_interval_sec = _env_int("PLATFORM_STATUS_CHECK_INTERVAL_SEC", 30)
+
+        self.enabled = bool(self.task_id and self.token)
+        self._lock = threading.Lock()
+        self._active_clients: dict[str, float] = {}
+        self._task_running = False
+        self._last_status_check_ts = 0.0
+        self._monitor_stop = threading.Event()
+        self._monitor_thread: threading.Thread | None = None
+
+    @property
+    def heartbeat_interval_ms(self) -> int:
+        return max(1000, int(self.heartbeat_interval_sec * 1000))
+
+    def start(self) -> None:
+        if not self.enabled:
+            print("[platform] manager disabled (missing task_id or token)")
+            return
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            return
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop,
+            name="platform-task-monitor",
+            daemon=True,
+        )
+        self._monitor_thread.start()
+        print(
+            f"[platform] manager enabled: task_id={self.task_id}, service_port={self.service_port}, "
+            f"heartbeat={self.heartbeat_interval_sec}s/{self.heartbeat_timeout_sec}s"
+        )
+        try:
+            self.sync_task_state()
+        except Exception as exc:
+            print(f"[platform] initial state sync failed: {exc}")
+
+    def stop(self) -> None:
+        self._monitor_stop.set()
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=2.0)
+
+    def build_head_script(self) -> str:
+        return """
+<script>
+(() => {
+  const state = {
+    enabled: false,
+    clientId: null,
+    heartbeatTimer: null,
+    disconnecting: false,
+    heartbeatIntervalMs: 15000,
+  };
+
+  const buildClientId = () => {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  };
+
+  const postJson = async (url, payload, keepalive = false) => {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      cache: "no-store",
+      keepalive,
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return response.json();
+  };
+
+  const heartbeat = async () => {
+    if (!state.enabled || !state.clientId) {
+      return;
+    }
+    try {
+      await postJson("/platform/heartbeat", { client_id: state.clientId });
+    } catch (error) {
+      // Keep trying on the next interval.
+    }
+  };
+
+  const disconnect = (isUnload) => {
+    if (!state.enabled || !state.clientId || state.disconnecting) {
+      return;
+    }
+    state.disconnecting = true;
+    if (state.heartbeatTimer) {
+      window.clearInterval(state.heartbeatTimer);
+      state.heartbeatTimer = null;
+    }
+    postJson(
+      "/platform/disconnect",
+      { client_id: state.clientId },
+      Boolean(isUnload)
+    ).catch(() => {});
+  };
+
+  const start = async () => {
+    try {
+      const configResp = await fetch("/platform/config", { cache: "no-store" });
+      if (!configResp.ok) {
+        return;
+      }
+      const config = await configResp.json();
+      if (!config || !config.enabled) {
+        return;
+      }
+
+      state.enabled = true;
+      state.clientId = buildClientId();
+      state.heartbeatIntervalMs = Number(config.heartbeat_interval_ms) || 15000;
+
+      await postJson("/platform/connect", { client_id: state.clientId });
+      state.heartbeatTimer = window.setInterval(heartbeat, state.heartbeatIntervalMs);
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+          heartbeat();
+        }
+      });
+      window.addEventListener("pagehide", () => disconnect(true));
+      window.addEventListener("beforeunload", () => disconnect(true));
+    } catch (error) {
+      // Browser-side lifecycle support is best-effort.
+    }
+  };
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start, { once: true });
+  } else {
+    start();
+  }
+})();
+</script>
+"""
+
+    @staticmethod
+    def _extract_payload_message(payload: object) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        message = (
+            payload.get("message")
+            or payload.get("msg")
+            or payload.get("detail")
+            or payload.get("error")
+            or ""
+        )
+        if isinstance(message, str):
+            return message
+        if isinstance(message, (dict, list)):
+            return json.dumps(message, ensure_ascii=False)
+        return str(message or "")
+
+    @staticmethod
+    def _is_api_success(payload: object) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        code = str(payload.get("code", "")).strip().lower()
+        return code in {"0000", "0", "200", "ok", "success"}
+
+    @staticmethod
+    def _normalize_status(status: str) -> str:
+        return str(status or "").strip().lower()
+
+    @classmethod
+    def _is_running_status(cls, status: str) -> bool:
+        normalized = cls._normalize_status(status)
+        return bool(
+            re.search(
+                r"running|ready|online|available|success|active|启动中|运行中",
+                normalized,
+                re.IGNORECASE,
+            )
+        )
+
+    def _headers(self, include_content_type: bool = True) -> dict[str, str]:
+        headers = {
+            "token": self.token,
+            "timestamp": str(int(time.time() * 1000)),
+            "version": self.api_version,
+        }
+        if include_content_type:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def _call_openapi(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        include_content_type: bool = True,
+    ) -> dict:
+        if not self.enabled:
+            raise RuntimeError("platform manager is disabled")
+
+        url = f"{self.openapi_base}{path}"
+        response = requests.request(
+            method=method,
+            url=url,
+            headers=self._headers(include_content_type=include_content_type),
+            json=payload,
+            timeout=20,
+        )
+
+        body = None
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+
+        if not response.ok:
+            detail = self._extract_payload_message(body) or response.text.strip() or f"HTTP {response.status_code}"
+            raise RuntimeError(detail)
+
+        if body is None:
+            return {}
+
+        if not self._is_api_success(body):
+            message = self._extract_payload_message(body)
+            code = body.get("code", "unknown") if isinstance(body, dict) else "unknown"
+            raise RuntimeError(message or f"openapi business code: {code}")
+
+        return body
+
+    def _extract_task_status(self, detail_payload: dict) -> str:
+        data = detail_payload.get("data", {}) if isinstance(detail_payload, dict) else {}
+        if not isinstance(data, dict):
+            return ""
+        return str(data.get("status") or data.get("task_status") or data.get("taskStatus") or "").strip()
+
+    def _extract_service_base_url(self, detail_payload: dict) -> str:
+        data = detail_payload.get("data", {}) if isinstance(detail_payload, dict) else {}
+        if not isinstance(data, dict):
+            return ""
+
+        services = data.get("services", [])
+        if not isinstance(services, list):
+            return ""
+
+        fallback = ""
+        for service in services:
+            if not isinstance(service, dict):
+                continue
+            remote_ports = service.get("remote_ports", [])
+            if not isinstance(remote_ports, list):
+                continue
+            for item in remote_ports:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url", "")).strip()
+                if not url:
+                    continue
+                if not fallback:
+                    fallback = url
+                try:
+                    service_port = int(item.get("service_port", -1))
+                except (TypeError, ValueError):
+                    service_port = -1
+                if service_port == int(self.service_port):
+                    return url.rstrip("/")
+        return fallback.rstrip("/") if fallback else ""
+
+    def get_task_detail(self) -> dict:
+        query = quote_plus(str(self.task_id))
+        return self._call_openapi(
+            method="GET",
+            path=f"/api/deployment/task/detail?task_id={query}",
+            include_content_type=False,
+        )
+
+    def recover_task(self) -> dict:
+        try:
+            payload = self._call_openapi(
+                method="POST",
+                path="/api/deployment/task/recover",
+                payload={"task_id": self.task_id},
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            if self._RECOVER_ALREADY_RUNNING_PATTERN.search(message):
+                payload = {"message": message}
+            else:
+                raise
+
+        with self._lock:
+            self._task_running = True
+        return payload
+
+    def pause_task(self) -> dict:
+        try:
+            payload = self._call_openapi(
+                method="POST",
+                path="/api/deployment/task/pause",
+                payload={"task_id": self.task_id},
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            if self._PAUSE_ALREADY_PAUSED_PATTERN.search(message):
+                payload = {"message": message}
+            else:
+                raise
+
+        with self._lock:
+            self._task_running = False
+        return payload
+
+    def _prune_stale_clients_locked(self, now: float) -> None:
+        stale_ids = [
+            client_id
+            for client_id, ts in self._active_clients.items()
+            if (now - ts) > self.heartbeat_timeout_sec
+        ]
+        for client_id in stale_ids:
+            self._active_clients.pop(client_id, None)
+
+    def _active_client_count(self) -> int:
+        with self._lock:
+            self._prune_stale_clients_locked(time.time())
+            return len(self._active_clients)
+
+    def status_snapshot(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "task_id": self.task_id,
+            "service_port": self.service_port,
+            "active_clients": self._active_client_count(),
+            "task_running_cached": self._task_running,
+            "heartbeat_interval_ms": self.heartbeat_interval_ms,
+            "heartbeat_timeout_sec": self.heartbeat_timeout_sec,
+        }
+
+    def sync_task_state(self) -> dict:
+        if not self.enabled:
+            return {"enabled": False}
+
+        detail = self.get_task_detail()
+        status = self._extract_task_status(detail)
+        service_base_url = self._extract_service_base_url(detail)
+        running = self._is_running_status(status)
+
+        with self._lock:
+            self._task_running = running
+
+        active_clients = self._active_client_count()
+        if active_clients > 0 and not running:
+            self.recover_task()
+            running = True
+
+        return {
+            "task_status": status,
+            "service_base_url": service_base_url,
+            "task_running": running,
+            "active_clients": active_clients,
+        }
+
+    def register_client(self, client_id: str) -> dict:
+        now = time.time()
+        with self._lock:
+            self._prune_stale_clients_locked(now)
+            was_idle = len(self._active_clients) == 0
+            self._active_clients[client_id] = now
+        if was_idle:
+            self.recover_task()
+        return self.status_snapshot()
+
+    def heartbeat_client(self, client_id: str) -> dict:
+        now = time.time()
+        should_sync = False
+        with self._lock:
+            self._active_clients[client_id] = now
+            self._prune_stale_clients_locked(now)
+            if (now - self._last_status_check_ts) >= self.status_check_interval_sec:
+                self._last_status_check_ts = now
+                should_sync = True
+
+        if should_sync:
+            try:
+                self.sync_task_state()
+            except Exception as exc:
+                print(f"[platform] heartbeat sync failed: {exc}")
+
+        return self.status_snapshot()
+
+    def disconnect_client(self, client_id: str, pause_if_idle: bool = True) -> dict:
+        with self._lock:
+            self._active_clients.pop(client_id, None)
+            self._prune_stale_clients_locked(time.time())
+            has_clients = len(self._active_clients) > 0
+        if pause_if_idle and not has_clients:
+            self.pause_task()
+        return self.status_snapshot()
+
+    def _monitor_loop(self) -> None:
+        while not self._monitor_stop.wait(timeout=self.monitor_interval_sec):
+            try:
+                active_count = self._active_client_count()
+                if active_count == 0:
+                    if self._task_running:
+                        self.pause_task()
+                    continue
+
+                now = time.time()
+                with self._lock:
+                    should_sync = (now - self._last_status_check_ts) >= self.status_check_interval_sec
+                    if should_sync:
+                        self._last_status_check_ts = now
+                if should_sync:
+                    self.sync_task_state()
+            except Exception as exc:
+                print(f"[platform] monitor error: {exc}")
+
+
+PLATFORM_TASK_MANAGER = PlatformTaskManager()
 
 # -------------------------------------------------------------------------
 # Model inference
@@ -889,6 +1350,7 @@ theme = gr.themes.Base()
 
 with gr.Blocks(
     theme=theme,
+    head=PLATFORM_TASK_MANAGER.build_head_script(),
     css="""
     .custom-log * {
         font-style: italic;
@@ -1839,10 +2301,102 @@ with gr.Blocks(
     </div>
     """)
 
-    demo.queue().launch(
-        show_error=True,
-        share=False,
-        server_name="0.0.0.0",
-        server_port=10085,
-        ssr_mode=False,
+class PlatformClientPayload(BaseModel):
+    client_id: str
+
+
+def _validate_client_id(client_id: str) -> str:
+    normalized = str(client_id or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="client_id is required")
+    if len(normalized) > 128:
+        raise HTTPException(status_code=400, detail="client_id is too long")
+    return normalized
+
+
+def create_fastapi_app(gradio_blocks: gr.Blocks, task_manager: PlatformTaskManager) -> FastAPI:
+    api = FastAPI(title="HunyuanWorld-Mirror Service", version="1.0.0")
+
+    @api.get("/health")
+    def health_check():
+        return {
+            "status": "ok",
+            "platform_enabled": task_manager.enabled,
+            "active_clients": task_manager.status_snapshot().get("active_clients", 0),
+        }
+
+    @api.get("/platform/config")
+    def platform_config():
+        snapshot = task_manager.status_snapshot()
+        return {
+            "enabled": snapshot["enabled"],
+            "task_id": snapshot["task_id"],
+            "service_port": snapshot["service_port"],
+            "heartbeat_interval_ms": snapshot["heartbeat_interval_ms"],
+            "heartbeat_timeout_sec": snapshot["heartbeat_timeout_sec"],
+        }
+
+    @api.post("/platform/connect")
+    def platform_connect(payload: PlatformClientPayload):
+        if not task_manager.enabled:
+            return {"enabled": False}
+        client_id = _validate_client_id(payload.client_id)
+        try:
+            snapshot = task_manager.register_client(client_id)
+            runtime = task_manager.sync_task_state()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"platform connect failed: {exc}")
+        return {**snapshot, **runtime}
+
+    @api.post("/platform/heartbeat")
+    def platform_heartbeat(payload: PlatformClientPayload):
+        if not task_manager.enabled:
+            return {"enabled": False}
+        client_id = _validate_client_id(payload.client_id)
+        try:
+            snapshot = task_manager.heartbeat_client(client_id)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"platform heartbeat failed: {exc}")
+        return snapshot
+
+    @api.post("/platform/disconnect")
+    def platform_disconnect(payload: PlatformClientPayload):
+        if not task_manager.enabled:
+            return {"enabled": False}
+        client_id = _validate_client_id(payload.client_id)
+        try:
+            snapshot = task_manager.disconnect_client(client_id, pause_if_idle=True)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"platform disconnect failed: {exc}")
+        return snapshot
+
+    @api.get("/platform/status")
+    def platform_status(refresh: bool = False):
+        snapshot = task_manager.status_snapshot()
+        if not task_manager.enabled:
+            return snapshot
+        if not refresh:
+            return snapshot
+        try:
+            runtime = task_manager.sync_task_state()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"platform status refresh failed: {exc}")
+        return {**snapshot, **runtime}
+
+    return gr.mount_gradio_app(api, gradio_blocks, path="/")
+
+
+queued_demo = demo.queue()
+app = create_fastapi_app(queued_demo, PLATFORM_TASK_MANAGER)
+PLATFORM_TASK_MANAGER.start()
+
+
+if __name__ == "__main__":
+    host = os.getenv("APP_HOST", os.getenv("HOST", "0.0.0.0"))
+    port = _env_int("APP_PORT", _env_int("PORT", 10085))
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level=os.getenv("UVICORN_LOG_LEVEL", "info"),
     )
