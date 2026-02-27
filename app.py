@@ -114,7 +114,7 @@ class PlatformTaskManager:
         self.openapi_base = os.getenv("PLATFORM_OPENAPI_BASE", "https://openapi.suanli.cn").rstrip("/")
         self.api_version = os.getenv("PLATFORM_API_VERSION", "1.0.0").strip() or "1.0.0"
         # Use env vars first; fallback to current deployment values for quick setup.
-        self.task_id = (os.getenv("PLATFORM_TASK_ID") or "1558859").strip()
+        self.task_id = (os.getenv("PLATFORM_TASK_ID") or "1554725").strip()
         self.service_port = _env_int("PLATFORM_SERVICE_PORT", 10085)
         self.token = (
             os.getenv("PLATFORM_TOKEN")
