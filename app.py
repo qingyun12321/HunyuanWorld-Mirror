@@ -425,9 +425,13 @@ class PlatformTaskManager:
     if (!navigator || typeof navigator.sendBeacon !== "function") {
       return false;
     }
+    const clientId = payload && payload.client_id ? String(payload.client_id) : "";
+    if (!clientId) {
+      return false;
+    }
     try {
-      const body = new Blob([JSON.stringify(payload)], { type: "application/json" });
-      return navigator.sendBeacon("/platform/disconnect-beacon", body);
+      const url = "/platform/disconnect-beacon?client_id=" + encodeURIComponent(clientId);
+      return navigator.sendBeacon(url);
     } catch (error) {
       return false;
     }
@@ -443,8 +447,16 @@ class PlatformTaskManager:
       state.heartbeatTimer = null;
     }
     const payload = { client_id: state.clientId };
-    if (isUnload && sendDisconnectBeacon(payload)) {
-      return;
+    if (isUnload) {
+      sendDisconnectBeacon(payload);
+      try {
+        fetch(
+          "/platform/disconnect-ping?client_id=" + encodeURIComponent(state.clientId),
+          { method: "GET", cache: "no-store", keepalive: true }
+        ).catch(() => {});
+      } catch (error) {
+        // Ignore unload transport errors.
+      }
     }
     postJson(
       "/platform/disconnect",
@@ -2597,24 +2609,42 @@ def create_fastapi_app(gradio_blocks: gr.Blocks, task_manager: PlatformTaskManag
             raise HTTPException(status_code=500, detail=f"platform disconnect failed: {exc}")
         return snapshot
 
+    @api.get("/platform/disconnect-ping")
+    def platform_disconnect_ping(client_id: str):
+        if not task_manager.enabled:
+            return {"enabled": False}
+        normalized_client_id = _validate_client_id(client_id)
+        try:
+            snapshot = task_manager.disconnect_client(
+                normalized_client_id,
+                pause_if_idle=True,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"platform disconnect ping failed: {exc}",
+            )
+        return snapshot
+
     @api.post("/platform/disconnect-beacon")
-    async def platform_disconnect_beacon(request: Request):
+    async def platform_disconnect_beacon(request: Request, client_id: str = ""):
         if not task_manager.enabled:
             return {"enabled": False}
 
-        client_id = ""
-        try:
-            payload = await request.json()
-        except Exception:
-            payload = None
+        normalized_client_id = str(client_id or "").strip()
+        if not normalized_client_id:
+            try:
+                payload = await request.json()
+            except Exception:
+                payload = None
 
-        if isinstance(payload, dict):
-            client_id = str(payload.get("client_id") or "").strip()
-        if not client_id:
-            raw_body = await request.body()
-            client_id = _extract_client_id_from_raw_body(raw_body)
+            if isinstance(payload, dict):
+                normalized_client_id = str(payload.get("client_id") or "").strip()
+            if not normalized_client_id:
+                raw_body = await request.body()
+                normalized_client_id = _extract_client_id_from_raw_body(raw_body)
 
-        normalized_client_id = _validate_client_id(client_id)
+        normalized_client_id = _validate_client_id(normalized_client_id)
         try:
             snapshot = task_manager.disconnect_client(
                 normalized_client_id,
