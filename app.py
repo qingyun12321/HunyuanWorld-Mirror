@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 import io
 import sys
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -25,7 +25,7 @@ import requests
 import spaces
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pillow_heif import register_heif_opener
@@ -326,10 +326,10 @@ class PlatformTaskManager:
             or "f2ee1c4c-b678-4b3e-850b-e56a6f57bfd3-20260208093806"
         ).strip()
         self.heartbeat_interval_sec = _env_int("PLATFORM_HEARTBEAT_INTERVAL_SEC", 20)
-        self.heartbeat_timeout_sec = _env_int("PLATFORM_HEARTBEAT_TIMEOUT_SEC", 90)
+        self.heartbeat_timeout_sec = _env_int("PLATFORM_HEARTBEAT_TIMEOUT_SEC", 45)
         self.monitor_interval_sec = _env_int("PLATFORM_MONITOR_INTERVAL_SEC", 5)
         self.status_check_interval_sec = _env_int("PLATFORM_STATUS_CHECK_INTERVAL_SEC", 30)
-        self.idle_pause_grace_sec = _env_int("PLATFORM_IDLE_PAUSE_GRACE_SEC", 120)
+        self.idle_pause_grace_sec = _env_int("PLATFORM_IDLE_PAUSE_GRACE_SEC", 30)
 
         self.enabled = bool(self.task_id and self.token)
         self._lock = threading.Lock()
@@ -421,6 +421,18 @@ class PlatformTaskManager:
     }
   };
 
+  const sendDisconnectBeacon = (payload) => {
+    if (!navigator || typeof navigator.sendBeacon !== "function") {
+      return false;
+    }
+    try {
+      const body = new Blob([JSON.stringify(payload)], { type: "application/json" });
+      return navigator.sendBeacon("/platform/disconnect-beacon", body);
+    } catch (error) {
+      return false;
+    }
+  };
+
   const disconnect = (isUnload) => {
     if (!state.enabled || !state.clientId || state.disconnecting) {
       return;
@@ -430,9 +442,13 @@ class PlatformTaskManager:
       window.clearInterval(state.heartbeatTimer);
       state.heartbeatTimer = null;
     }
+    const payload = { client_id: state.clientId };
+    if (isUnload && sendDisconnectBeacon(payload)) {
+      return;
+    }
     postJson(
       "/platform/disconnect",
-      { client_id: state.clientId },
+      payload,
       Boolean(isUnload)
     ).catch(() => {});
   };
@@ -462,6 +478,7 @@ class PlatformTaskManager:
       });
       window.addEventListener("pagehide", () => disconnect(true));
       window.addEventListener("beforeunload", () => disconnect(true));
+      window.addEventListener("unload", () => disconnect(true));
     } catch (error) {
       // Browser-side lifecycle support is best-effort.
     }
@@ -740,6 +757,7 @@ class PlatformTaskManager:
             self._prune_stale_clients_locked(time.time())
             has_clients = len(self._active_clients) > 0
         if pause_if_idle and not has_clients:
+            print(f"[platform] last active client disconnected: client_id={client_id}, pausing task")
             self.pause_task()
         return self.status_snapshot()
 
@@ -749,13 +767,20 @@ class PlatformTaskManager:
                 active_count = self._active_client_count()
                 if active_count == 0:
                     now = time.time()
-                    should_pause = False
                     with self._lock:
                         idle_ref = max(self._last_recover_ts, self._last_client_activity_ts)
                         idle_sec = now - idle_ref if idle_ref > 0 else now
-                        should_pause = self._task_running and idle_sec >= self.idle_pause_grace_sec
-                    if should_pause:
-                        self.pause_task()
+                        should_check_pause = idle_sec >= self.idle_pause_grace_sec
+                    if should_check_pause:
+                        runtime = self.sync_task_state()
+                        if runtime.get("task_running"):
+                            print(
+                                f"[platform] no active clients for {idle_sec:.1f}s, pausing task"
+                            )
+                            self.pause_task()
+                        else:
+                            with self._lock:
+                                self._task_running = False
                     continue
 
                 now = time.time()
@@ -2490,6 +2515,25 @@ def _validate_client_id(client_id: str) -> str:
     return normalized
 
 
+def _extract_client_id_from_raw_body(raw_body: bytes) -> str:
+    if not raw_body:
+        return ""
+    text = raw_body.decode("utf-8", errors="ignore").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        return str(payload.get("client_id") or "").strip()
+    parsed_qs = parse_qs(text, keep_blank_values=False)
+    values = parsed_qs.get("client_id") or []
+    if values:
+        return str(values[0] or "").strip()
+    return ""
+
+
 def create_fastapi_app(gradio_blocks: gr.Blocks, task_manager: PlatformTaskManager) -> FastAPI:
     api = FastAPI(title="HunyuanWorld-Mirror Service", version="1.0.0")
     api.add_middleware(
@@ -2551,6 +2595,36 @@ def create_fastapi_app(gradio_blocks: gr.Blocks, task_manager: PlatformTaskManag
             snapshot = task_manager.disconnect_client(client_id, pause_if_idle=True)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"platform disconnect failed: {exc}")
+        return snapshot
+
+    @api.post("/platform/disconnect-beacon")
+    async def platform_disconnect_beacon(request: Request):
+        if not task_manager.enabled:
+            return {"enabled": False}
+
+        client_id = ""
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = None
+
+        if isinstance(payload, dict):
+            client_id = str(payload.get("client_id") or "").strip()
+        if not client_id:
+            raw_body = await request.body()
+            client_id = _extract_client_id_from_raw_body(raw_body)
+
+        normalized_client_id = _validate_client_id(client_id)
+        try:
+            snapshot = task_manager.disconnect_client(
+                normalized_client_id,
+                pause_if_idle=True,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"platform disconnect beacon failed: {exc}",
+            )
         return snapshot
 
     @api.get("/platform/status")
