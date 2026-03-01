@@ -65,27 +65,37 @@ OSS_PREFIX = "docker-input&output/hunyuanworld-mirror"
 
 def oss_upload(local_path: str, oss_key: str) -> None:
     oss_url = f"oss://{OSS_BUCKET}/{oss_key}"
-    subprocess.run(["ossutil", "cp", local_path, oss_url, "-f"],
-                   check=True, capture_output=True)
+    r = subprocess.run(["ossutil", "cp", local_path, oss_url, "-f"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[oss] upload failed: {r.stderr.strip()}")
+        raise RuntimeError(f"ossutil cp failed: {r.stderr.strip()}")
 
 
 def oss_upload_dir(local_dir: str, oss_key_dir: str) -> None:
     oss_url = f"oss://{OSS_BUCKET}/{oss_key_dir}"
-    subprocess.run(["ossutil", "cp", local_dir, oss_url, "-rf"],
-                   check=True, capture_output=True)
+    r = subprocess.run(["ossutil", "cp", local_dir, oss_url, "-rf"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[oss] upload dir failed: {r.stderr.strip()}")
+        raise RuntimeError(f"ossutil cp -r failed: {r.stderr.strip()}")
 
 
-def oss_sign_url(oss_key: str, timeout: int = 3600) -> str:
+def oss_sign_url(oss_key: str, expires: str = "1h") -> str:
+    """Generate a presigned download URL using ossutil presign."""
     oss_url = f"oss://{OSS_BUCKET}/{oss_key}"
     result = subprocess.run(
-        ["ossutil", "sign", oss_url, "--timeout", str(timeout)],
-        capture_output=True, text=True, check=True,
+        ["ossutil", "presign", oss_url, "--expires-duration", expires],
+        capture_output=True, text=True,
     )
+    if result.returncode != 0:
+        print(f"[oss] presign failed: {result.stderr.strip()}")
+        raise RuntimeError(f"ossutil presign failed: {result.stderr.strip()}")
     for line in result.stdout.strip().splitlines():
         line = line.strip()
         if line.startswith("https://") or line.startswith("http://"):
             return line
-    return result.stdout.strip()
+    return result.stdout.strip().splitlines()[0].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -436,20 +446,14 @@ def generate_and_upload_results(
         colors = outputs["splats"][colors_key][0].reshape(-1, 3)
         opacities = outputs["splats"]["opacities"][0].reshape(-1)
 
-        for name, arr in [("means", means), ("scales", scales), ("quats", quats),
-                          ("colors", colors), ("opacities", opacities)]:
-            if not isinstance(arr, torch.Tensor):
-                locals()[name]  # just reference; reassign below
-        if not isinstance(means, torch.Tensor):
-            means = torch.from_numpy(means)
-        if not isinstance(scales, torch.Tensor):
-            scales = torch.from_numpy(scales)
-        if not isinstance(quats, torch.Tensor):
-            quats = torch.from_numpy(quats)
-        if not isinstance(colors, torch.Tensor):
-            colors = torch.from_numpy(colors)
-        if not isinstance(opacities, torch.Tensor):
-            opacities = torch.from_numpy(opacities)
+        def _to_tensor(x):
+            return x if isinstance(x, torch.Tensor) else torch.from_numpy(x)
+
+        means = _to_tensor(means)
+        scales = _to_tensor(scales)
+        quats = _to_tensor(quats)
+        colors = _to_tensor(colors)
+        opacities = _to_tensor(opacities)
 
         ply_path = os.path.join(target_dir, "gaussians.ply")
         save_gs_ply(ply_path, means, scales, quats, colors, opacities)
