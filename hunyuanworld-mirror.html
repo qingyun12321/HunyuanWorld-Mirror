@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Kokoni - HunyuanWorld-Mirror</title>
+  <title>Kokoni - 3D 重建</title>
   <script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
   <style>
     :root {
@@ -354,7 +354,7 @@
 <main>
   <header>
     <h1>Kokoni</h1>
-    <p class="subtitle">HunyuanWorld-Mirror 3D 重建</p>
+    <p class="subtitle">3D 重建</p>
   </header>
 
   <section class="grid">
@@ -390,11 +390,11 @@
 
       <!-- Tabs -->
       <div class="tabs" id="tab-bar">
-        <button class="tab-btn active" data-tab="gs">3D Gaussian Splatting</button>
-        <button class="tab-btn" data-tab="pc">Point Cloud / Mesh</button>
-        <button class="tab-btn" data-tab="depth">Depth</button>
-        <button class="tab-btn" data-tab="normal">Normal</button>
-        <button class="tab-btn" data-tab="cam">Camera Params</button>
+        <button class="tab-btn active" data-tab="gs">3D 高斯泼溅</button>
+        <button class="tab-btn" data-tab="pc">点云 / 网格</button>
+        <button class="tab-btn" data-tab="depth">深度图</button>
+        <button class="tab-btn" data-tab="normal">法线图</button>
+        <button class="tab-btn" data-tab="cam">相机参数</button>
       </div>
 
       <!-- Tab: Gaussian Splatting -->
@@ -402,15 +402,15 @@
         <div class="viewer-box">
           <model-viewer id="gs-viewer" camera-controls touch-action="pan-y" auto-rotate
                         shadow-intensity="0" exposure="1" style="display:none;"></model-viewer>
-          <div id="gs-placeholder" class="viewer-placeholder">完成重建后，3DGS 场景将在此显示。</div>
+          <div id="gs-placeholder" class="viewer-placeholder">完成重建后，3D 高斯泼溅场景将在此显示。</div>
         </div>
         <div class="video-row hidden" id="gs-videos">
           <div>
-            <label>渲染 RGB 视频</label>
+            <label>渲染彩色视频</label>
             <video id="rgb-video" controls playsinline></video>
           </div>
           <div>
-            <label>渲染 Depth 视频</label>
+            <label>渲染深度视频</label>
             <video id="depth-video" controls playsinline></video>
           </div>
         </div>
@@ -428,20 +428,20 @@
       <!-- Tab: Depth -->
       <div id="tab-depth" class="tab-content">
         <div class="view-nav" id="depth-nav">
-          <span id="depth-label">View 1 / 1</span>
+          <span id="depth-label">视图 1 / 1</span>
           <input id="depth-slider" type="range" min="0" max="0" value="0" step="1" />
         </div>
-        <img id="depth-img" class="view-img hidden" alt="Depth Map" />
+        <img id="depth-img" class="view-img hidden" alt="深度图" />
         <div id="depth-placeholder" class="viewer-placeholder">完成重建后，深度图将在此显示。</div>
       </div>
 
       <!-- Tab: Normal -->
       <div id="tab-normal" class="tab-content">
         <div class="view-nav" id="normal-nav">
-          <span id="normal-label">View 1 / 1</span>
+          <span id="normal-label">视图 1 / 1</span>
           <input id="normal-slider" type="range" min="0" max="0" value="0" step="1" />
         </div>
-        <img id="normal-img" class="view-img hidden" alt="Normal Map" />
+        <img id="normal-img" class="view-img hidden" alt="法线图" />
         <div id="normal-placeholder" class="viewer-placeholder">完成重建后，法线图将在此显示。</div>
       </div>
 
@@ -455,8 +455,8 @@
 
       <!-- Downloads row -->
       <div id="download-row" class="downloads hidden">
-        <a id="dl-glb" class="download-link hidden" href="#" download="scene.glb">下载 GLB</a>
-        <a id="dl-ply" class="download-link hidden" href="#" download="gaussians.ply">下载 PLY</a>
+        <a id="dl-glb" class="download-link hidden" href="#" download="scene.glb">下载 GLB 模型</a>
+        <a id="dl-ply" class="download-link hidden" href="#" download="gaussians.ply">下载 PLY 点云</a>
       </div>
 
       <!-- Actions -->
@@ -467,15 +467,15 @@
 
       <!-- Frame selector + options -->
       <div class="section">
-        <label for="frame-selector">Show Points of a Specific Frame</label>
-        <select id="frame-selector"><option value="All">All</option></select>
+        <label for="frame-selector">显示特定帧的点</label>
+        <select id="frame-selector"><option value="All">全部</option></select>
       </div>
 
       <div class="options-row">
-        <label><input type="checkbox" id="opt-camera" checked /> Show Camera</label>
-        <label><input type="checkbox" id="opt-mesh" checked /> Show Mesh</label>
-        <label><input type="checkbox" id="opt-ambiguous" checked /> Filter Ambiguous</label>
-        <label><input type="checkbox" id="opt-sky" /> Filter Sky</label>
+        <label><input type="checkbox" id="opt-camera" checked /> 显示相机</label>
+        <label><input type="checkbox" id="opt-mesh" checked /> 显示网格</label>
+        <label><input type="checkbox" id="opt-ambiguous" checked /> 过滤模糊点</label>
+        <label><input type="checkbox" id="opt-sky" /> 过滤天空</label>
       </div>
     </div>
   </section>
@@ -600,7 +600,7 @@
 
   // ---- Task manager calls ----
   const tmRecover = async () => {
-    appendLog("requesting task recovery...");
+    appendLog("正在请求恢复任务...");
     const resp = await fetch(`${config.taskManager}/api/task/recover`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -608,15 +608,15 @@
     });
     if (!resp.ok) {
       const detail = await resp.text();
-      throw new Error(`recover failed: ${detail}`);
+      throw new Error(`恢复失败：${detail}`);
     }
     const data = await resp.json();
-    appendLog(`recover done: recovered=${data.recovered}, url=${data.service_url}`);
+    appendLog(`恢复完成：recovered=${data.recovered}, url=${data.service_url}`);
     return data;
   };
 
   const tmPause = async () => {
-    appendLog("requesting task pause...");
+    appendLog("正在请求暂停任务...");
     try {
       const resp = await fetch(`${config.taskManager}/api/task/pause`, {
         method: "POST",
@@ -624,12 +624,12 @@
         body: JSON.stringify({ project: config.project }),
       });
       if (resp.ok) {
-        appendLog("task paused.");
+        appendLog("任务已暂停。");
       } else {
-        appendLog(`pause response: ${resp.status}`);
+        appendLog(`暂停响应：${resp.status}`);
       }
     } catch (e) {
-      appendLog(`pause error: ${e.message}`);
+      appendLog(`暂停出错：${e.message}`);
     }
   };
 
@@ -680,7 +680,7 @@
     if (data.depth_urls && data.depth_urls.length > 0) {
       depthSlider.max = data.depth_urls.length - 1;
       depthSlider.value = 0;
-      depthLabel.textContent = `View 1 / ${data.depth_urls.length}`;
+      depthLabel.textContent = `视图 1 / ${data.depth_urls.length}`;
       depthImg.src = data.depth_urls[0];
       depthImg.classList.remove("hidden");
       depthPlaceholder.style.display = "none";
@@ -689,7 +689,7 @@
     if (data.normal_urls && data.normal_urls.length > 0) {
       normalSlider.max = data.normal_urls.length - 1;
       normalSlider.value = 0;
-      normalLabel.textContent = `View 1 / ${data.normal_urls.length}`;
+      normalLabel.textContent = `视图 1 / ${data.normal_urls.length}`;
       normalImg.src = data.normal_urls[0];
       normalImg.classList.remove("hidden");
       normalPlaceholder.style.display = "none";
@@ -720,14 +720,14 @@
   depthSlider.addEventListener("input", () => {
     if (!resultData || !resultData.depth_urls) return;
     const idx = parseInt(depthSlider.value);
-    depthLabel.textContent = `View ${idx + 1} / ${resultData.depth_urls.length}`;
+    depthLabel.textContent = `视图 ${idx + 1} / ${resultData.depth_urls.length}`;
     if (resultData.depth_urls[idx]) depthImg.src = resultData.depth_urls[idx];
   });
 
   normalSlider.addEventListener("input", () => {
     if (!resultData || !resultData.normal_urls) return;
     const idx = parseInt(normalSlider.value);
-    normalLabel.textContent = `View ${idx + 1} / ${resultData.normal_urls.length}`;
+    normalLabel.textContent = `视图 ${idx + 1} / ${resultData.normal_urls.length}`;
     if (resultData.normal_urls[idx]) normalImg.src = resultData.normal_urls[idx];
   });
 
@@ -752,13 +752,13 @@
     depthImg.removeAttribute("src");
     depthPlaceholder.style.display = "block";
     depthSlider.max = 0; depthSlider.value = 0;
-    depthLabel.textContent = "View 1 / 1";
+    depthLabel.textContent = "视图 1 / 1";
 
     normalImg.classList.add("hidden");
     normalImg.removeAttribute("src");
     normalPlaceholder.style.display = "block";
     normalSlider.max = 0; normalSlider.value = 0;
-    normalLabel.textContent = "View 1 / 1";
+    normalLabel.textContent = "视图 1 / 1";
 
     camDownload.classList.add("hidden");
     camPlaceholder.style.display = "block";
@@ -771,7 +771,7 @@
     dlGlb.classList.add("hidden");
     dlPly.classList.add("hidden");
 
-    frameSelector.innerHTML = '<option value="All">All</option>';
+    frameSelector.innerHTML = '<option value="All">全部</option>';
 
     setStatus("准备就绪，上传文件后点击 重构 开始处理。", "idle");
   };
@@ -802,7 +802,7 @@
       // 2. Wait for GPU backend /health
       setStatus("等待 GPU 后端就绪...", "loading");
       await waitForHealth(runtimeApiBase);
-      appendLog("backend ready at " + runtimeApiBase);
+      appendLog("后端已就绪：" + runtimeApiBase);
 
       // 3. Build FormData
       const requestId = crypto.randomUUID
@@ -855,7 +855,7 @@
       // 6. Show results from OSS URLs
       const data = await resp.json();
       showResults(data);
-      appendLog(`reconstruction complete: session=${data.session_id}`);
+      appendLog(`重建完成：session=${data.session_id}`);
 
       // 7. Pause task immediately
       setStatus("重建完成，正在暂停任务...", "loading");
@@ -866,7 +866,7 @@
     } catch (e) {
       requestError = e;
       setStatus(`请求失败：${e.message}`, "error");
-      appendLog(`error: ${e.message}`);
+      appendLog(`出错：${e.message}`);
     } finally {
       if (queueTimer) clearInterval(queueTimer);
 
@@ -890,9 +890,9 @@
   });
 
   // ---- Init ----
-  appendLog(`task_manager=${config.taskManager}`);
-  appendLog(`project=${config.project}`);
-  appendLog("ready.");
+  appendLog(`任务管理器=${config.taskManager}`);
+  appendLog(`项目=${config.project}`);
+  appendLog("就绪。");
 })();
 </script>
 </body>
