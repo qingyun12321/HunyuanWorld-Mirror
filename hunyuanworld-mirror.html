@@ -7,41 +7,68 @@
   <script type="importmap">
   { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
   </script>
-  <script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/PLYLoader.js";
 
     const SH_C0 = 0.28209479177387814;
+    const MAX_PLY_POINTS = 1200000;
 
-    function fitPointCloudCamera(camera, controls, geometry) {
-      if (!geometry.boundingBox) {
-        geometry.computeBoundingBox();
+    function ensureBox(box, object) {
+      if (!box || box.isEmpty()) {
+        return new THREE.Box3().setFromObject(object);
       }
-      const box = geometry.boundingBox;
-      if (box.isEmpty()) return;
+      return box;
+    }
+
+    function fitCameraToBox(camera, controls, box, yDown) {
+      if (!box || box.isEmpty()) return;
 
       const size = box.getSize(new THREE.Vector3());
       const center = box.getCenter(new THREE.Vector3());
       const maxDim = Math.max(size.x, size.y, size.z, 0.01);
       const fov = THREE.MathUtils.degToRad(camera.fov);
       const distance = (maxDim / (2 * Math.tan(fov / 2))) * 1.6;
+      const ySign = yDown ? -1 : 1;
 
       camera.position.set(
         center.x + distance,
-        center.y - distance * 0.55,
+        center.y + ySign * distance * 0.55,
         center.z + distance,
       );
       camera.near = Math.max(distance / 1000, 0.01);
       camera.far = Math.max(distance * 40, 100);
       camera.updateProjectionMatrix();
+      camera.lookAt(center);
 
       controls.target.copy(center);
       controls.update();
     }
 
-    function createOrbitViewer(container) {
+    function disposeObject3D(object) {
+      if (!object) return;
+      object.traverse((node) => {
+        if (node.geometry) node.geometry.dispose();
+        if (node.material) {
+          const materials = Array.isArray(node.material) ? node.material : [node.material];
+          materials.forEach((m) => m && m.dispose && m.dispose());
+        }
+      });
+    }
+
+    function createModelViewer(
+      container,
+      {
+        yDown = false,
+        zoomSpeed = 1.0,
+        panSpeed = 1.0,
+        rotateSpeed = 1.0,
+        enableDamping = true,
+        gradioAdaptive = false,
+      } = {},
+    ) {
       const width = Math.max(container.clientWidth || 1, 1);
       const height = Math.max(container.clientHeight || 1, 1);
       container.innerHTML = "";
@@ -62,19 +89,37 @@
       const scene = new THREE.Scene();
       const camera = new THREE.PerspectiveCamera(45, width / height, 0.01, 5000);
       camera.position.set(0, 0, 3);
-      camera.up.set(0, -1, 0);
+      camera.up.set(0, yDown ? -1 : 1, 0);
 
       const controls = new OrbitControls(camera, renderer.domElement);
-      controls.enableDamping = true;
-      controls.dampingFactor = 0.08;
+      controls.enableDamping = enableDamping;
+      controls.dampingFactor = 0.06;
       controls.screenSpacePanning = true;
+      controls.zoomSpeed = zoomSpeed;
+      controls.panSpeed = panSpeed;
+      controls.rotateSpeed = rotateSpeed;
+      controls.minDistance = 0.1;
+      controls.maxDistance = 1e6;
       controls.target.set(0, 0, 0);
+
+      const baseZoomSpeed = zoomSpeed;
+      const basePanSpeed = panSpeed;
+      const updateControlSensibility = () => {
+        // Approximate Gradio/Babylon feel for GLB scenes.
+        if (!gradioAdaptive) return;
+        const distance = Math.max(camera.position.distanceTo(controls.target), 0.1);
+        controls.zoomSpeed = THREE.MathUtils.clamp((0.35 + distance * 0.08) * baseZoomSpeed, 0.15, 4.0);
+        controls.panSpeed = THREE.MathUtils.clamp((0.25 + distance * 0.06) * basePanSpeed, 0.08, 4.0);
+      };
 
       const hemi = new THREE.HemisphereLight(0xffffff, 0x334455, 0.95);
       scene.add(hemi);
       const key = new THREE.DirectionalLight(0xffffff, 0.8);
       key.position.set(3, 4, 2);
       scene.add(key);
+
+      const contentRoot = new THREE.Group();
+      scene.add(contentRoot);
 
       const resize = () => {
         const w = Math.max(container.clientWidth || 1, 1);
@@ -91,6 +136,7 @@
       let rafId = 0;
       const animate = () => {
         rafId = requestAnimationFrame(animate);
+        updateControlSensibility();
         controls.update();
         renderer.render(scene, camera);
       };
@@ -100,8 +146,24 @@
         scene,
         camera,
         controls,
-        renderer,
+        contentRoot,
+        yDown,
+        setContent(object3d, box = null) {
+          while (contentRoot.children.length) {
+            const child = contentRoot.children[0];
+            contentRoot.remove(child);
+            disposeObject3D(child);
+          }
+          contentRoot.add(object3d);
+          const fittedBox = ensureBox(box, object3d);
+          fitCameraToBox(camera, controls, fittedBox, yDown);
+        },
         dispose() {
+          while (contentRoot.children.length) {
+            const child = contentRoot.children[0];
+            contentRoot.remove(child);
+            disposeObject3D(child);
+          }
           if (rafId) cancelAnimationFrame(rafId);
           resizeObserver.disconnect();
           window.removeEventListener("resize", resize);
@@ -125,8 +187,48 @@
       return new THREE.Float32BufferAttribute(colors, 3);
     }
 
+    function simplifyPointCloudGeometry(geometry) {
+      const positionAttr = geometry.getAttribute("position");
+      const colorAttr = geometry.getAttribute("color");
+      if (!positionAttr || positionAttr.count <= MAX_PLY_POINTS) return geometry;
+
+      const step = Math.ceil(positionAttr.count / MAX_PLY_POINTS);
+      const sampledCount = Math.ceil(positionAttr.count / step);
+      const sampledPos = new Float32Array(sampledCount * 3);
+      const sampledColor = colorAttr ? new Float32Array(sampledCount * 3) : null;
+
+      let dst = 0;
+      for (let src = 0; src < positionAttr.count; src += step) {
+        sampledPos[dst * 3 + 0] = positionAttr.getX(src);
+        sampledPos[dst * 3 + 1] = positionAttr.getY(src);
+        sampledPos[dst * 3 + 2] = positionAttr.getZ(src);
+        if (sampledColor) {
+          sampledColor[dst * 3 + 0] = colorAttr.getX(src);
+          sampledColor[dst * 3 + 1] = colorAttr.getY(src);
+          sampledColor[dst * 3 + 2] = colorAttr.getZ(src);
+        }
+        dst += 1;
+      }
+
+      const sampledGeometry = new THREE.BufferGeometry();
+      sampledGeometry.setAttribute("position", new THREE.Float32BufferAttribute(sampledPos, 3));
+      if (sampledColor) {
+        sampledGeometry.setAttribute("color", new THREE.Float32BufferAttribute(sampledColor, 3));
+      }
+      geometry.dispose();
+      return sampledGeometry;
+    }
+
+    function calcPointSizeFromBox(box) {
+      const size = box.getSize(new THREE.Vector3());
+      const diag = Math.max(size.length(), 0.01);
+      return THREE.MathUtils.clamp(diag / 900, 0.002, 0.02);
+    }
+
     window._gsViewer = null;
+    window._pcViewer = null;
     window._gsPendingUrl = null;
+    window._pcPendingUrl = null;
 
     window._disposeGS = function() {
       if (window._gsViewer) {
@@ -135,11 +237,24 @@
       }
     };
 
+    window._disposePC = function() {
+      if (window._pcViewer) {
+        try { window._pcViewer.dispose(); } catch (e) {}
+        window._pcViewer = null;
+      }
+    };
+
     window._loadGS = async function(url, container) {
       window._disposeGS();
-      container.innerHTML = '';
+      container.innerHTML = "";
 
-      const viewer = createOrbitViewer(container);
+      const viewer = createModelViewer(container, {
+        yDown: false,
+        zoomSpeed: 1.0,
+        panSpeed: 1.0,
+        rotateSpeed: 1.0,
+        gradioAdaptive: false,
+      });
       const plyLoader = new PLYLoader();
       plyLoader.setCustomPropertyNameMapping({
         sh: ["f_dc_0", "f_dc_1", "f_dc_2"],
@@ -151,41 +266,13 @@
           const shColor = buildShColorAttribute(geometry);
           if (shColor) geometry.setAttribute("color", shColor);
         }
-
-        const positionAttr = geometry.getAttribute("position");
-        const colorAttr = geometry.getAttribute("color");
-        const maxPoints = 1200000;
-        if (positionAttr && positionAttr.count > maxPoints) {
-          const step = Math.ceil(positionAttr.count / maxPoints);
-          const sampledCount = Math.ceil(positionAttr.count / step);
-          const sampledPos = new Float32Array(sampledCount * 3);
-          const sampledColor = colorAttr ? new Float32Array(sampledCount * 3) : null;
-
-          let dst = 0;
-          for (let src = 0; src < positionAttr.count; src += step) {
-            sampledPos[dst * 3 + 0] = positionAttr.getX(src);
-            sampledPos[dst * 3 + 1] = positionAttr.getY(src);
-            sampledPos[dst * 3 + 2] = positionAttr.getZ(src);
-            if (sampledColor) {
-              sampledColor[dst * 3 + 0] = colorAttr.getX(src);
-              sampledColor[dst * 3 + 1] = colorAttr.getY(src);
-              sampledColor[dst * 3 + 2] = colorAttr.getZ(src);
-            }
-            dst += 1;
-          }
-
-          const sampledGeometry = new THREE.BufferGeometry();
-          sampledGeometry.setAttribute("position", new THREE.Float32BufferAttribute(sampledPos, 3));
-          if (sampledColor) {
-            sampledGeometry.setAttribute("color", new THREE.Float32BufferAttribute(sampledColor, 3));
-          }
-          geometry.dispose();
-          geometry = sampledGeometry;
-        }
+        geometry = simplifyPointCloudGeometry(geometry);
+        geometry.computeBoundingBox();
+        const bbox = geometry.boundingBox || new THREE.Box3();
 
         const hasColor = !!geometry.getAttribute("color");
         const material = new THREE.PointsMaterial({
-          size: 0.012,
+          size: calcPointSizeFromBox(bbox),
           sizeAttenuation: true,
           vertexColors: hasColor,
           color: hasColor ? 0xffffff : 0xd9e2f2,
@@ -195,17 +282,92 @@
 
         const points = new THREE.Points(geometry, material);
         points.frustumCulled = false;
-        viewer.scene.add(points);
-        fitPointCloudCamera(viewer.camera, viewer.controls, geometry);
+        viewer.setContent(points, bbox);
 
-        const state = {
-          dispose() {
-            geometry.dispose();
-            material.dispose();
-            viewer.dispose();
-          },
-        };
-        window._gsViewer = state;
+        window._gsViewer = viewer;
+      } catch (err) {
+        viewer.dispose();
+        throw err;
+      }
+    };
+
+    function findRenderableBox(root) {
+      const primary = new THREE.Box3();
+      const fallback = new THREE.Box3();
+      let hasPrimary = false;
+      let hasFallback = false;
+      root.traverse((node) => {
+        if (node.isMesh || node.isPoints) {
+          primary.expandByObject(node);
+          hasPrimary = true;
+          return;
+        }
+        if (node.isLineSegments || node.isLine) {
+          fallback.expandByObject(node);
+          hasFallback = true;
+        }
+      });
+      if (hasPrimary && !primary.isEmpty()) return primary;
+      if (hasFallback && !fallback.isEmpty()) return fallback;
+      return new THREE.Box3().setFromObject(root);
+    }
+
+    function stripCameraAndHelperNodes(root) {
+      const removable = [];
+      root.traverse((node) => {
+        if (node === root) return;
+        const name = (node.name || "").toLowerCase();
+        const isCameraLike =
+          node.isCamera ||
+          name.includes("camera") ||
+          name.includes("frustum") ||
+          name.startsWith("cam_");
+        const isHelperLike =
+          (node.isLine || node.isLineSegments || node.isPoints || node.isMesh) &&
+          (name.includes("helper") || name.includes("gizmo") || name.includes("axis"));
+        if (isCameraLike || isHelperLike) {
+          removable.push(node);
+        }
+      });
+      removable.forEach((node) => {
+        if (!node.parent) return;
+        node.parent.remove(node);
+        disposeObject3D(node);
+      });
+    }
+
+    window._loadPC = async function(url, container, { showCamera = true } = {}) {
+      window._disposePC();
+      container.innerHTML = "";
+
+      const viewer = createModelViewer(container, {
+        yDown: false,
+        zoomSpeed: 0.4,
+        panSpeed: 0.4,
+        rotateSpeed: 0.9,
+        gradioAdaptive: true,
+      });
+      const loader = new GLTFLoader();
+      try {
+        const gltf = await loader.loadAsync(url);
+        const root = gltf.scene || (gltf.scenes && gltf.scenes[0]);
+        if (!root) throw new Error("GLB 场景为空");
+
+        if (!showCamera) {
+          stripCameraAndHelperNodes(root);
+        }
+
+        root.traverse((node) => {
+          if (node.isPoints && node.material && "size" in node.material) {
+            node.material.size = Math.max(node.material.size || 0.004, 0.004);
+            node.material.sizeAttenuation = true;
+            node.material.needsUpdate = true;
+          }
+        });
+
+        const box = findRenderableBox(root);
+        viewer.setContent(root, box);
+        window._pcViewer = viewer;
       } catch (err) {
         viewer.dispose();
         throw err;
@@ -213,6 +375,7 @@
     };
 
     window.dispatchEvent(new Event('gs3d-ready'));
+    window.dispatchEvent(new Event('pc3d-ready'));
   </script>
   <style>
     :root {
@@ -426,10 +589,10 @@
       overflow: hidden;
     }
 
-    model-viewer {
+    .three-host {
       width: 100%;
       height: 400px;
-      --poster-color: transparent;
+      position: relative;
     }
 
     .viewer-placeholder {
@@ -565,6 +728,13 @@
       border-radius: 12px;
     }
 
+    .three-host canvas {
+      width: 100% !important;
+      height: 100% !important;
+      display: block;
+      border-radius: 12px;
+    }
+
     .hidden { display: none !important; }
 
     @media (max-width: 900px) {
@@ -640,8 +810,7 @@
       <!-- Tab: Point Cloud / Mesh -->
       <div id="tab-pc" class="tab-content">
         <div class="viewer-box">
-          <model-viewer id="pc-viewer" camera-controls touch-action="pan-y"
-                        shadow-intensity="0" exposure="1" style="display:none;"></model-viewer>
+          <div id="pc-viewer" class="three-host hidden"></div>
           <div id="pc-placeholder" class="viewer-placeholder">完成重建后，点云/网格将在此显示。</div>
         </div>
       </div>
@@ -778,7 +947,12 @@
     gsPlaceholder.style.display = "none";
     await window._loadGS(url, gsContainer);
   };
-  window._pcPendingUrl = null;
+  const renderPcPreview = async (url) => {
+    const showCamera = document.getElementById("opt-camera")?.checked ?? true;
+    pcPlaceholder.style.display = "none";
+    pcViewer.classList.remove("hidden");
+    await window._loadPC(url, pcViewer, { showCamera });
+  };
 
   // ---- Tabs ----
   document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -800,12 +974,15 @@
         });
       }
 
-      if (btn.dataset.tab === "pc" && window._pcPendingUrl) {
+      if (btn.dataset.tab === "pc" && window._pcPendingUrl && typeof window._loadPC === "function") {
         const url = window._pcPendingUrl;
         window._pcPendingUrl = null;
-        pcViewer.src = url;
-        pcViewer.style.display = "block";
-        pcPlaceholder.style.display = "none";
+        renderPcPreview(url).catch((e) => {
+          appendLog(`点云/网格加载失败：${e.message}`);
+          pcViewer.classList.add("hidden");
+          pcPlaceholder.textContent = "点云/网格加载失败，请下载 GLB 文件查看。";
+          pcPlaceholder.style.display = "block";
+        });
       }
     });
   });
@@ -821,6 +998,19 @@
       gsContainer.appendChild(gsPlaceholder);
       gsPlaceholder.textContent = "高斯泼溅加载失败，请下载 PLY 文件查看。";
       gsPlaceholder.style.display = "block";
+    });
+  });
+
+  window.addEventListener("pc3d-ready", () => {
+    if (!window._pcPendingUrl || typeof window._loadPC !== "function") return;
+    if (!document.getElementById("tab-pc").classList.contains("active")) return;
+    const url = window._pcPendingUrl;
+    window._pcPendingUrl = null;
+    renderPcPreview(url).catch((e) => {
+      appendLog(`点云/网格加载失败：${e.message}`);
+      pcViewer.classList.add("hidden");
+      pcPlaceholder.textContent = "点云/网格加载失败，请下载 GLB 文件查看。";
+      pcPlaceholder.style.display = "block";
     });
   });
 
@@ -947,15 +1137,21 @@
 
     if (data.glb_url) {
       const pcTab = document.getElementById("tab-pc");
-      if (pcTab.classList.contains("active")) {
+      if (typeof window._loadPC === "function" && pcTab.classList.contains("active")) {
         window._pcPendingUrl = null;
-        pcViewer.src = data.glb_url;
-        pcViewer.style.display = "block";
-        pcPlaceholder.style.display = "none";
+        renderPcPreview(data.glb_url).catch((e) => {
+          appendLog(`点云/网格加载失败：${e.message}`);
+          pcViewer.classList.add("hidden");
+          pcPlaceholder.textContent = "点云/网格加载失败，请下载 GLB 文件查看。";
+          pcPlaceholder.style.display = "block";
+        });
       } else {
         window._pcPendingUrl = data.glb_url;
-        pcViewer.style.display = "none";
-        pcPlaceholder.textContent = "切换到此标签页后将加载点云/网格预览...";
+        pcViewer.classList.add("hidden");
+        pcPlaceholder.textContent =
+          typeof window._loadPC === "function"
+            ? "切换到此标签页后将加载点云/网格预览..."
+            : "3D 预览组件加载中，切换到此标签页后会自动显示。";
         pcPlaceholder.style.display = "block";
       }
     }
@@ -1020,6 +1216,18 @@
     if (resultData.normal_urls[idx]) normalImg.src = resultData.normal_urls[idx];
   });
 
+  document.getElementById("opt-camera").addEventListener("change", () => {
+    if (!resultData || !resultData.glb_url) return;
+    const pcTab = document.getElementById("tab-pc");
+    if (pcTab.classList.contains("active")) {
+      renderPcPreview(resultData.glb_url).catch((e) => {
+        appendLog(`点云/网格刷新失败：${e.message}`);
+      });
+    } else {
+      window._pcPendingUrl = resultData.glb_url;
+    }
+  });
+
   // ---- Clear ----
   const clearAll = () => {
     resultData = null;
@@ -1037,8 +1245,8 @@
     gsPlaceholder.textContent = '完成重建后，3D 高斯泼溅场景将在此显示。';
     gsPlaceholder.style.display = "block";
     window._pcPendingUrl = null;
-    pcViewer.removeAttribute("src");
-    pcViewer.style.display = "none";
+    window._disposePC?.();
+    pcViewer.classList.add("hidden");
     pcPlaceholder.textContent = "完成重建后，点云/网格将在此显示。";
     pcPlaceholder.style.display = "block";
 
