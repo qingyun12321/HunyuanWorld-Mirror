@@ -4,7 +4,47 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Kokoni - 3D 重建</title>
+  <script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+  </script>
   <script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
+  <script type="module">
+    import * as GaussianSplats3D from 'https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.min.js';
+    window._gsLib = GaussianSplats3D;
+    window._gsViewer = null;
+    window._gsPendingUrl = null;
+
+    window._loadGS = async function(url, container) {
+      window._disposeGS();
+      container.innerHTML = '';
+      const viewer = new GaussianSplats3D.Viewer({
+        rootElement: container,
+        cameraUp: [0, -1, 0],
+        initialCameraPosition: [0, -4, 6],
+        initialCameraLookAt: [0, 0, 0],
+        sceneRevealMode: GaussianSplats3D.SceneRevealMode.Instant,
+        logLevel: GaussianSplats3D.LogLevel.None,
+        antialiased: false,
+        sphericalHarmonicsDegree: 0,
+      });
+      await viewer.addSplatScene(url, {
+        splatAlphaRemovalThreshold: 5,
+        showLoadingUI: true,
+        progressiveLoad: true,
+      });
+      viewer.start();
+      window._gsViewer = viewer;
+    };
+
+    window._disposeGS = function() {
+      if (window._gsViewer) {
+        try { window._gsViewer.dispose(); } catch(e) {}
+        window._gsViewer = null;
+      }
+    };
+
+    window.dispatchEvent(new Event('gs3d-ready'));
+  </script>
   <style>
     :root {
       --bg: #0f1115;
@@ -342,6 +382,20 @@
     .slider-row input[type="range"] { flex: 1; }
     .slider-row .val { font-size: 0.82rem; color: var(--text-soft); width: 30px; text-align: right; }
 
+    #gs-container {
+      width: 100%;
+      height: 400px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    #gs-container canvas {
+      width: 100% !important;
+      height: 100% !important;
+      display: block;
+      border-radius: 12px;
+    }
+
     .hidden { display: none !important; }
 
     @media (max-width: 900px) {
@@ -399,9 +453,7 @@
 
       <!-- Tab: Gaussian Splatting -->
       <div id="tab-gs" class="tab-content active">
-        <div class="viewer-box">
-          <model-viewer id="gs-viewer" camera-controls touch-action="pan-y" auto-rotate
-                        shadow-intensity="0" exposure="1" style="display:none;"></model-viewer>
+        <div class="viewer-box" id="gs-container">
           <div id="gs-placeholder" class="viewer-placeholder">完成重建后，3D 高斯泼溅场景将在此显示。</div>
         </div>
         <div class="video-row hidden" id="gs-videos">
@@ -471,6 +523,7 @@
         <select id="frame-selector"><option value="All">全部</option></select>
       </div>
 
+      <div style="font-size:0.82rem;color:var(--text-faint);margin-bottom:4px;">重建选项（仅作用于点云/网格，不适用于 3D 高斯泼溅）</div>
       <div class="options-row">
         <label><input type="checkbox" id="opt-camera" checked /> 显示相机</label>
         <label><input type="checkbox" id="opt-mesh" checked /> 显示网格</label>
@@ -506,7 +559,7 @@
   const clearBtn = document.getElementById("clear-btn");
   const frameSelector = document.getElementById("frame-selector");
 
-  const gsViewer = document.getElementById("gs-viewer");
+  const gsContainer = document.getElementById("gs-container");
   const gsPlaceholder = document.getElementById("gs-placeholder");
   const pcViewer = document.getElementById("pc-viewer");
   const pcPlaceholder = document.getElementById("pc-placeholder");
@@ -559,6 +612,19 @@
       document.querySelectorAll(".tab-content").forEach((c) => c.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+
+      if (btn.dataset.tab === "gs" && window._gsPendingUrl && typeof window._loadGS === 'function') {
+        const url = window._gsPendingUrl;
+        window._gsPendingUrl = null;
+        gsPlaceholder.style.display = "none";
+        window._loadGS(url, gsContainer).catch(e => {
+          appendLog(`GS 加载失败：${e.message}`);
+          gsContainer.innerHTML = '';
+          gsContainer.appendChild(gsPlaceholder);
+          gsPlaceholder.textContent = '高斯泼溅加载失败，请下载 PLY 文件使用桌面工具查看。';
+          gsPlaceholder.style.display = 'block';
+        });
+      }
     });
   });
 
@@ -662,10 +728,27 @@
   const showResults = (data) => {
     resultData = data;
 
-    if (data.glb_url) {
-      gsViewer.src = data.glb_url;
-      gsViewer.style.display = "block";
+    if (data.ply_url && typeof window._loadGS === 'function') {
       gsPlaceholder.style.display = "none";
+      window._gsPendingUrl = null;
+      const gsTab = document.getElementById("tab-gs");
+      if (gsTab.classList.contains("active")) {
+        window._loadGS(data.ply_url, gsContainer).catch(e => {
+          appendLog(`GS 加载失败：${e.message}`);
+          gsContainer.innerHTML = '';
+          gsContainer.appendChild(gsPlaceholder);
+          gsPlaceholder.textContent = '高斯泼溅加载失败，请下载 PLY 文件使用桌面工具查看。';
+          gsPlaceholder.style.display = 'block';
+        });
+      } else {
+        window._gsPendingUrl = data.ply_url;
+        gsPlaceholder.textContent = '切换到此标签页后将加载 3D 高斯泼溅预览...';
+      }
+    } else if (data.ply_url) {
+      gsPlaceholder.textContent = '浏览器不支持 3D 高斯泼溅实时预览，请下载 PLY 文件查看。';
+    }
+
+    if (data.glb_url) {
       pcViewer.src = data.glb_url;
       pcViewer.style.display = "block";
       pcPlaceholder.style.display = "none";
@@ -741,8 +824,11 @@
     gallery.innerHTML = '<div class="gallery-placeholder">请上传文件</div>';
     logEl.textContent = "";
 
-    gsViewer.removeAttribute("src");
-    gsViewer.style.display = "none";
+    window._disposeGS?.();
+    window._gsPendingUrl = null;
+    gsContainer.innerHTML = '';
+    gsContainer.appendChild(gsPlaceholder);
+    gsPlaceholder.textContent = '完成重建后，3D 高斯泼溅场景将在此显示。';
     gsPlaceholder.style.display = "block";
     pcViewer.removeAttribute("src");
     pcViewer.style.display = "none";
