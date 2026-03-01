@@ -7,17 +7,19 @@
   <script type="importmap">
   { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
   </script>
+  <script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
-    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/PLYLoader.js";
-    import * as GaussianSplats3D from 'https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.min.js';
 
     const SH_C0 = 0.28209479177387814;
 
-    function fitOrbitCamera(camera, controls, object3d) {
-      const box = new THREE.Box3().setFromObject(object3d);
+    function fitPointCloudCamera(camera, controls, geometry) {
+      if (!geometry.boundingBox) {
+        geometry.computeBoundingBox();
+      }
+      const box = geometry.boundingBox;
       if (box.isEmpty()) return;
 
       const size = box.getSize(new THREE.Vector3());
@@ -122,11 +124,8 @@
       return new THREE.Float32BufferAttribute(colors, 3);
     }
 
-    window._gsLib = GaussianSplats3D;
     window._gsViewer = null;
     window._gsPendingUrl = null;
-    window._pcViewer = null;
-    window._pcPendingUrl = null;
 
     window._disposeGS = function() {
       if (window._gsViewer) {
@@ -135,15 +134,10 @@
       }
     };
 
-    window._disposePC = function() {
-      if (window._pcViewer) {
-        try { window._pcViewer.dispose(); } catch (e) {}
-        window._pcViewer = null;
-      }
-    };
-
-    async function loadPlyAsPointCloud(url, container) {
+    window._loadGS = async function(url, container) {
+      window._disposeGS();
       container.innerHTML = '';
+
       const viewer = createOrbitViewer(container);
       const plyLoader = new PLYLoader();
       plyLoader.setCustomPropertyNameMapping({
@@ -151,10 +145,41 @@
       });
 
       try {
-        const geometry = await plyLoader.loadAsync(url);
+        let geometry = await plyLoader.loadAsync(url);
         if (!geometry.getAttribute("color")) {
           const shColor = buildShColorAttribute(geometry);
           if (shColor) geometry.setAttribute("color", shColor);
+        }
+
+        const positionAttr = geometry.getAttribute("position");
+        const colorAttr = geometry.getAttribute("color");
+        const maxPoints = 1200000;
+        if (positionAttr && positionAttr.count > maxPoints) {
+          const step = Math.ceil(positionAttr.count / maxPoints);
+          const sampledCount = Math.ceil(positionAttr.count / step);
+          const sampledPos = new Float32Array(sampledCount * 3);
+          const sampledColor = colorAttr ? new Float32Array(sampledCount * 3) : null;
+
+          let dst = 0;
+          for (let src = 0; src < positionAttr.count; src += step) {
+            sampledPos[dst * 3 + 0] = positionAttr.getX(src);
+            sampledPos[dst * 3 + 1] = positionAttr.getY(src);
+            sampledPos[dst * 3 + 2] = positionAttr.getZ(src);
+            if (sampledColor) {
+              sampledColor[dst * 3 + 0] = colorAttr.getX(src);
+              sampledColor[dst * 3 + 1] = colorAttr.getY(src);
+              sampledColor[dst * 3 + 2] = colorAttr.getZ(src);
+            }
+            dst += 1;
+          }
+
+          const sampledGeometry = new THREE.BufferGeometry();
+          sampledGeometry.setAttribute("position", new THREE.Float32BufferAttribute(sampledPos, 3));
+          if (sampledColor) {
+            sampledGeometry.setAttribute("color", new THREE.Float32BufferAttribute(sampledColor, 3));
+          }
+          geometry.dispose();
+          geometry = sampledGeometry;
         }
 
         const hasColor = !!geometry.getAttribute("color");
@@ -170,7 +195,7 @@
         const points = new THREE.Points(geometry, material);
         points.frustumCulled = false;
         viewer.scene.add(points);
-        fitOrbitCamera(viewer.camera, viewer.controls, points);
+        fitPointCloudCamera(viewer.camera, viewer.controls, geometry);
 
         const state = {
           dispose() {
@@ -179,102 +204,7 @@
             viewer.dispose();
           },
         };
-        return state;
-      } catch (err) {
-        viewer.dispose();
-        throw err;
-      }
-    }
-
-    window._loadGS = async function(url, container) {
-      window._disposeGS();
-      container.innerHTML = "";
-
-      const viewer = new GaussianSplats3D.Viewer({
-        rootElement: container,
-        cameraUp: [0, -1, 0],
-        initialCameraPosition: [0, -4, 6],
-        initialCameraLookAt: [0, 0, 0],
-        sceneRevealMode: GaussianSplats3D.SceneRevealMode.Instant,
-        logLevel: GaussianSplats3D.LogLevel.None,
-        antialiased: false,
-        sphericalHarmonicsDegree: 0,
-      });
-
-      const addOptions = {
-        splatAlphaRemovalThreshold: 5,
-        showLoadingUI: true,
-        progressiveLoad: false,
-      };
-      const formatEnum = GaussianSplats3D.SceneFormat;
-      if (formatEnum && (formatEnum.Ply !== undefined || formatEnum.PLY !== undefined)) {
-        addOptions.format = formatEnum.Ply !== undefined ? formatEnum.Ply : formatEnum.PLY;
-      }
-
-      try {
-        await viewer.addSplatScene(url, addOptions);
-        viewer.start();
-        window._gsViewer = viewer;
-      } catch (primaryErr) {
-        try { viewer.dispose(); } catch (e) {}
-        try {
-          window._gsViewer = await loadPlyAsPointCloud(url, container);
-        } catch (fallbackErr) {
-          throw new Error(
-            `高斯泼溅加载失败：${primaryErr?.message || primaryErr}; 回退点云加载也失败：${fallbackErr?.message || fallbackErr}`
-          );
-        }
-      }
-    };
-
-    window._loadPC = async function(url, container) {
-      window._disposePC();
-      container.innerHTML = "";
-
-      const viewer = createOrbitViewer(container);
-      const loader = new GLTFLoader();
-      try {
-        const gltf = await loader.loadAsync(url);
-        const root = gltf.scene || (gltf.scenes && gltf.scenes[0]);
-        if (!root) throw new Error("GLB 场景为空");
-
-        const materials = new Set();
-        root.traverse((node) => {
-          if (node.isMesh) {
-            const mats = Array.isArray(node.material) ? node.material : [node.material];
-            mats.forEach((mat) => {
-              if (!mat) return;
-              mat.side = THREE.DoubleSide;
-              if ("flatShading" in mat) mat.flatShading = false;
-              mat.needsUpdate = true;
-              materials.add(mat);
-            });
-            if (node.geometry && !node.geometry.getAttribute("normal")) {
-              node.geometry.computeVertexNormals();
-            }
-          } else if (node.isPoints && node.material) {
-            node.material.size = Math.max(node.material.size || 0.01, 0.01);
-            node.material.sizeAttenuation = true;
-            node.material.needsUpdate = true;
-            materials.add(node.material);
-          }
-        });
-
-        viewer.scene.add(root);
-        fitOrbitCamera(viewer.camera, viewer.controls, root);
-
-        const state = {
-          dispose() {
-            root.traverse((node) => {
-              if (node.geometry) {
-                node.geometry.dispose();
-              }
-            });
-            materials.forEach((mat) => mat.dispose());
-            viewer.dispose();
-          },
-        };
-        window._pcViewer = state;
+        window._gsViewer = state;
       } catch (err) {
         viewer.dispose();
         throw err;
@@ -282,7 +212,6 @@
     };
 
     window.dispatchEvent(new Event('gs3d-ready'));
-    window.dispatchEvent(new Event('pc3d-ready'));
   </script>
   <style>
     :root {
@@ -496,10 +425,10 @@
       overflow: hidden;
     }
 
-    .three-host {
+    model-viewer {
       width: 100%;
       height: 400px;
-      position: relative;
+      --poster-color: transparent;
     }
 
     .viewer-placeholder {
@@ -635,13 +564,6 @@
       border-radius: 12px;
     }
 
-    .three-host canvas {
-      width: 100% !important;
-      height: 100% !important;
-      display: block;
-      border-radius: 12px;
-    }
-
     .hidden { display: none !important; }
 
     @media (max-width: 900px) {
@@ -717,7 +639,8 @@
       <!-- Tab: Point Cloud / Mesh -->
       <div id="tab-pc" class="tab-content">
         <div class="viewer-box">
-          <div id="pc-viewer" class="three-host hidden"></div>
+          <model-viewer id="pc-viewer" camera-controls touch-action="pan-y"
+                        shadow-intensity="0" exposure="1" style="display:none;"></model-viewer>
           <div id="pc-placeholder" class="viewer-placeholder">完成重建后，点云/网格将在此显示。</div>
         </div>
       </div>
@@ -854,12 +777,7 @@
     gsPlaceholder.style.display = "none";
     await window._loadGS(url, gsContainer);
   };
-
-  const renderPcPreview = async (url) => {
-    pcPlaceholder.style.display = "none";
-    pcViewer.classList.remove("hidden");
-    await window._loadPC(url, pcViewer);
-  };
+  window._pcPendingUrl = null;
 
   // ---- Tabs ----
   document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -881,15 +799,12 @@
         });
       }
 
-      if (btn.dataset.tab === "pc" && window._pcPendingUrl && typeof window._loadPC === "function") {
+      if (btn.dataset.tab === "pc" && window._pcPendingUrl) {
         const url = window._pcPendingUrl;
         window._pcPendingUrl = null;
-        renderPcPreview(url).catch((e) => {
-          appendLog(`点云/网格加载失败：${e.message}`);
-          pcViewer.classList.add("hidden");
-          pcPlaceholder.textContent = "点云/网格加载失败，请下载 GLB 文件查看。";
-          pcPlaceholder.style.display = "block";
-        });
+        pcViewer.src = url;
+        pcViewer.style.display = "block";
+        pcPlaceholder.style.display = "none";
       }
     });
   });
@@ -905,19 +820,6 @@
       gsContainer.appendChild(gsPlaceholder);
       gsPlaceholder.textContent = "高斯泼溅加载失败，请下载 PLY 文件查看。";
       gsPlaceholder.style.display = "block";
-    });
-  });
-
-  window.addEventListener("pc3d-ready", () => {
-    if (!window._pcPendingUrl || typeof window._loadPC !== "function") return;
-    if (!document.getElementById("tab-pc").classList.contains("active")) return;
-    const url = window._pcPendingUrl;
-    window._pcPendingUrl = null;
-    renderPcPreview(url).catch((e) => {
-      appendLog(`点云/网格加载失败：${e.message}`);
-      pcViewer.classList.add("hidden");
-      pcPlaceholder.textContent = "点云/网格加载失败，请下载 GLB 文件查看。";
-      pcPlaceholder.style.display = "block";
     });
   });
 
@@ -1044,21 +946,15 @@
 
     if (data.glb_url) {
       const pcTab = document.getElementById("tab-pc");
-      if (typeof window._loadPC === "function" && pcTab.classList.contains("active")) {
+      if (pcTab.classList.contains("active")) {
         window._pcPendingUrl = null;
-        renderPcPreview(data.glb_url).catch((e) => {
-          appendLog(`点云/网格加载失败：${e.message}`);
-          pcViewer.classList.add("hidden");
-          pcPlaceholder.textContent = "点云/网格加载失败，请下载 GLB 文件查看。";
-          pcPlaceholder.style.display = "block";
-        });
+        pcViewer.src = data.glb_url;
+        pcViewer.style.display = "block";
+        pcPlaceholder.style.display = "none";
       } else {
         window._pcPendingUrl = data.glb_url;
-        pcViewer.classList.add("hidden");
-        pcPlaceholder.textContent =
-          typeof window._loadPC === "function"
-            ? "切换到此标签页后将加载点云/网格预览..."
-            : "3D 预览组件加载中，切换到此标签页后会自动显示。";
+        pcViewer.style.display = "none";
+        pcPlaceholder.textContent = "切换到此标签页后将加载点云/网格预览...";
         pcPlaceholder.style.display = "block";
       }
     }
@@ -1139,9 +1035,9 @@
     gsContainer.appendChild(gsPlaceholder);
     gsPlaceholder.textContent = '完成重建后，3D 高斯泼溅场景将在此显示。';
     gsPlaceholder.style.display = "block";
-    window._disposePC?.();
     window._pcPendingUrl = null;
-    pcViewer.classList.add("hidden");
+    pcViewer.removeAttribute("src");
+    pcViewer.style.display = "none";
     pcPlaceholder.textContent = "完成重建后，点云/网格将在此显示。";
     pcPlaceholder.style.display = "block";
 
