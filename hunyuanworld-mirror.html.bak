@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kokoni - HunyuanWorld-Mirror Launcher</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --bg-soft: #111933;
+      --card: rgba(18, 27, 53, 0.86);
+      --border: rgba(133, 154, 210, 0.28);
+      --text: #eef3ff;
+      --text-soft: rgba(238, 243, 255, 0.74);
+      --ok: #67d7a8;
+      --warn: #f6c26b;
+      --error: #ff8f9f;
+      --accent: #8db4ff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(120% 140% at 15% 0%, rgba(141, 180, 255, 0.16), transparent 58%),
+        radial-gradient(100% 130% at 85% 100%, rgba(103, 215, 168, 0.12), transparent 60%),
+        linear-gradient(180deg, var(--bg) 0%, #070b16 100%);
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    .shell {
+      width: min(760px, 100%);
+      border: 1px solid var(--border);
+      background: var(--card);
+      border-radius: 18px;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 24px 48px rgba(3, 7, 16, 0.55);
+      padding: 22px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 4vw, 2.8rem);
+      letter-spacing: 0.4px;
+      color: var(--accent);
+    }
+
+    .sub {
+      margin: 8px 0 0;
+      color: var(--text-soft);
+      font-size: 0.95rem;
+    }
+
+    .meta {
+      margin-top: 16px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px 14px;
+      font-size: 0.9rem;
+      color: var(--text-soft);
+    }
+
+    .meta strong {
+      color: var(--text);
+      font-weight: 600;
+      margin-right: 8px;
+    }
+
+    .status {
+      margin-top: 18px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(8, 13, 27, 0.78);
+      padding: 13px 14px;
+      min-height: 54px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      line-height: 1.55;
+      color: var(--text);
+      word-break: break-word;
+    }
+
+    .status.loading::before {
+      content: "";
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 2px solid rgba(141, 180, 255, 0.9);
+      border-top-color: transparent;
+      animation: spin 1s linear infinite;
+      flex: 0 0 auto;
+    }
+
+    .status.ok { border-color: rgba(103, 215, 168, 0.4); color: var(--ok); }
+    .status.warn { border-color: rgba(246, 194, 107, 0.4); color: var(--warn); }
+    .status.error { border-color: rgba(255, 143, 159, 0.45); color: var(--error); }
+
+    .actions {
+      margin-top: 16px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    button, a.button {
+      border: 1px solid rgba(141, 180, 255, 0.55);
+      border-radius: 10px;
+      padding: 10px 14px;
+      background: linear-gradient(120deg, rgba(141, 180, 255, 0.2), rgba(103, 215, 168, 0.18));
+      color: var(--text);
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+
+    .link-row {
+      margin-top: 12px;
+      color: var(--text-soft);
+      font-size: 0.88rem;
+      display: none;
+      word-break: break-all;
+    }
+
+    .log {
+      margin-top: 16px;
+      border: 1px solid rgba(133, 154, 210, 0.25);
+      border-radius: 10px;
+      background: rgba(6, 10, 21, 0.7);
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+      color: rgba(238, 243, 255, 0.86);
+      max-height: 240px;
+      overflow: auto;
+      padding: 10px 11px;
+      white-space: pre-wrap;
+      line-height: 1.45;
+    }
+
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    @media (max-width: 680px) {
+      .meta { grid-template-columns: 1fr; }
+      .shell { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <h1>Kokoni</h1>
+    <p class="sub">HunyuanWorld-Mirror 启动页：唤醒任务后自动进入应用。</p>
+
+    <section class="meta">
+      <div><strong>task_id</strong><span id="meta-task-id">-</span></div>
+      <div><strong>service_port</strong><span id="meta-service-port">-</span></div>
+      <div><strong>api_base</strong><span id="meta-api-base">-</span></div>
+      <div><strong>timeout</strong><span id="meta-timeout">-</span></div>
+    </section>
+
+    <div id="status" class="status">准备就绪，点击“启动并进入应用”。</div>
+
+    <div class="actions">
+      <button id="start-btn" type="button">启动并进入应用</button>
+      <button id="pause-btn" type="button">暂停任务</button>
+      <a id="open-btn" class="button" href="#" target="_self" style="display:none;">进入应用</a>
+    </div>
+
+    <div id="link-row" class="link-row">
+      应用地址：<span id="service-link"></span>
+    </div>
+
+    <pre id="log" class="log"></pre>
+  </main>
+
+  <script>
+    const launcherConfig = {
+      apiBase: "https://deployment-11493-d7qocwqs-10085.550w.link",
+      openApiBase: "https://openapi.suanli.cn",
+      version: "1.0.0",
+      taskId: 1554725,
+      servicePort: 10085,
+      token: "f2ee1c4c-b678-4b3e-850b-e56a6f57bfd3-20260208093806",
+      readyTimeoutMs: 15 * 60 * 1000,
+      pollMs: 2000,
+      autoStart: true,
+    };
+
+    const state = {
+      serviceBase: "",
+      runtimeApiBase: "",
+      recovering: false,
+      pauseOnUnload: false,
+      autoStarted: false,
+    };
+
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+    const startBtn = document.getElementById("start-btn");
+    const pauseBtn = document.getElementById("pause-btn");
+    const openBtn = document.getElementById("open-btn");
+    const linkRow = document.getElementById("link-row");
+    const serviceLinkEl = document.getElementById("service-link");
+
+    const setStatus = (message, type = "loading") => {
+      statusEl.className = `status ${type}`;
+      statusEl.textContent = message;
+    };
+
+    const appendLog = (line) => {
+      const ts = new Date().toLocaleTimeString();
+      logEl.textContent += `[${ts}] ${line}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    };
+
+    const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+    const normalizeCode = (code) =>
+      String(code === undefined || code === null ? "" : code).trim().toLowerCase();
+
+    const isApiSuccess = (payload) => {
+      if (!payload || typeof payload !== "object") {
+        return false;
+      }
+      const code = normalizeCode(payload.code);
+      return code === "0000" || code === "0" || code === "200" || code === "ok" || code === "success";
+    };
+
+    const extractPayloadMessage = (payload) => {
+      if (!payload || typeof payload !== "object") {
+        return "";
+      }
+      const message = payload.message || payload.msg || payload.detail || payload.error || "";
+      if (typeof message === "string") {
+        return message;
+      }
+      if (message && typeof message === "object") {
+        return JSON.stringify(message);
+      }
+      return String(message || "");
+    };
+
+    const isRecoverAlreadyRunning = (message) =>
+      /already|running|active|运行中|已运行|无需恢复|未暂停|must.*paused|任务必须为暂停中/i.test(message || "");
+
+    const isPauseAlreadyPaused = (message) =>
+      /already|paused|inactive|stopped|已暂停|无需暂停|must.*running|任务必须为运行中/i.test(message || "");
+
+    const normalizeStatus = (status) =>
+      String(status === undefined || status === null ? "" : status).trim().toLowerCase();
+
+    const isRunningStatus = (status) =>
+      /running|ready|online|available|success|active|启动中|运行中/.test(normalizeStatus(status));
+
+    const buildOpenApiHeaders = () => ({
+      "Content-Type": "application/json",
+      token: launcherConfig.token,
+      timestamp: String(Date.now()),
+      version: launcherConfig.version,
+    });
+
+    const buildOpenApiGetHeaders = () => ({
+      token: launcherConfig.token,
+      timestamp: String(Date.now()),
+      version: launcherConfig.version,
+    });
+
+    const extractTaskStatus = (detailPayload) => {
+      if (!detailPayload || typeof detailPayload !== "object") {
+        return "";
+      }
+      const data = detailPayload.data;
+      if (!data || typeof data !== "object") {
+        return "";
+      }
+      return String(data.status || data.task_status || data.taskStatus || "").trim();
+    };
+
+    const extractTaskServiceBaseUrl = (detailPayload) => {
+      if (!detailPayload || typeof detailPayload !== "object") {
+        return "";
+      }
+      const data = detailPayload.data;
+      if (!data || typeof data !== "object") {
+        return "";
+      }
+      const services = Array.isArray(data.services) ? data.services : [];
+      let fallback = "";
+      for (const service of services) {
+        const remotePorts = Array.isArray(service.remote_ports) ? service.remote_ports : [];
+        for (const portItem of remotePorts) {
+          const url = typeof portItem.url === "string" ? portItem.url.trim() : "";
+          if (!url) {
+            continue;
+          }
+          if (!fallback) {
+            fallback = url;
+          }
+          if (Number(portItem.service_port) === Number(launcherConfig.servicePort)) {
+            return url.replace(/\/$/, "");
+          }
+        }
+      }
+      return fallback ? fallback.replace(/\/$/, "") : "";
+    };
+
+    const callTaskDetailApi = async () => {
+      const response = await fetch(
+        `${launcherConfig.openApiBase}/api/deployment/task/detail?task_id=${encodeURIComponent(String(launcherConfig.taskId))}`,
+        {
+          method: "GET",
+          headers: buildOpenApiGetHeaders(),
+          cache: "no-store",
+        }
+      );
+
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        const detail = extractPayloadMessage(payload) || `HTTP ${response.status}`;
+        throw new Error(`detail 请求失败：${detail}`);
+      }
+
+      if (!isApiSuccess(payload)) {
+        const message = extractPayloadMessage(payload) || `业务码 ${payload && payload.code ? payload.code : "unknown"}`;
+        throw new Error(`detail 失败：${message}`);
+      }
+
+      return payload;
+    };
+
+    const callTaskControlApi = async (action) => {
+      const actionPath = action === "recover" ? "recover" : "pause";
+      const response = await fetch(`${launcherConfig.openApiBase}/api/deployment/task/${actionPath}`, {
+        method: "POST",
+        headers: buildOpenApiHeaders(),
+        body: JSON.stringify({ task_id: launcherConfig.taskId }),
+      });
+
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        const detail = extractPayloadMessage(payload) || `HTTP ${response.status}`;
+        throw new Error(`${actionPath} 请求失败：${detail}`);
+      }
+
+      if (!isApiSuccess(payload)) {
+        const message = extractPayloadMessage(payload) || `业务码 ${payload && payload.code ? payload.code : "unknown"}`;
+        if (action === "recover" && isRecoverAlreadyRunning(message)) {
+          return payload;
+        }
+        if (action === "pause" && isPauseAlreadyPaused(message)) {
+          return payload;
+        }
+        throw new Error(`${actionPath} 失败：${message}`);
+      }
+
+      return payload;
+    };
+
+    const updateServiceLink = (baseUrl) => {
+      if (!baseUrl) {
+        return;
+      }
+      state.serviceBase = baseUrl.replace(/\/$/, "");
+      state.runtimeApiBase = state.serviceBase;
+      const appUrl = `${state.serviceBase}/`;
+      openBtn.href = appUrl;
+      openBtn.style.display = "inline-flex";
+      linkRow.style.display = "block";
+      serviceLinkEl.textContent = appUrl;
+    };
+
+    const checkHealth = async (baseUrl) => {
+      try {
+        const response = await fetch(`${baseUrl}/health`, { cache: "no-store" });
+        return response.ok;
+      } catch (error) {
+        return false;
+      }
+    };
+
+    const waitForWorkerReady = async () => {
+      const deadline = Date.now() + launcherConfig.readyTimeoutMs;
+      let lastStatus = "";
+      let lastBase = "";
+      let runningHits = 0;
+      let fallbackBase = state.runtimeApiBase || launcherConfig.apiBase;
+
+      while (Date.now() < deadline) {
+        try {
+          const detail = await callTaskDetailApi();
+          const status = extractTaskStatus(detail);
+          const serviceBase = extractTaskServiceBaseUrl(detail);
+          if (status) {
+            lastStatus = status;
+          }
+          if (serviceBase) {
+            lastBase = serviceBase;
+            fallbackBase = serviceBase;
+            updateServiceLink(serviceBase);
+          }
+
+          if (isRunningStatus(status) && fallbackBase) {
+            runningHits += 1;
+            setStatus(`任务状态：${status}，正在确认服务可用...`, "loading");
+            appendLog(`task status=${status}, checking ${fallbackBase}/health`);
+            const healthOk = await checkHealth(fallbackBase);
+            if (healthOk || runningHits >= 3) {
+              updateServiceLink(fallbackBase);
+              return fallbackBase;
+            }
+          } else {
+            runningHits = 0;
+            setStatus(`任务状态：${status || "unknown"}，等待就绪...`, "loading");
+          }
+        } catch (error) {
+          appendLog(`轮询异常：${error.message}`);
+        }
+        await sleep(launcherConfig.pollMs);
+      }
+
+      throw new Error(`等待任务就绪超时。最后状态=${lastStatus || "unknown"}，最后地址=${lastBase || "none"}`);
+    };
+
+    const openApp = (baseUrl) => {
+      const appUrl = `${baseUrl.replace(/\/$/, "")}/`;
+      state.pauseOnUnload = false;
+      window.location.href = appUrl;
+    };
+
+    const startWorkflow = async (auto = false) => {
+      if (state.recovering) {
+        return;
+      }
+      state.recovering = true;
+      startBtn.disabled = true;
+      pauseBtn.disabled = true;
+      setStatus("正在查询任务状态...", "loading");
+
+      try {
+        appendLog("checking task detail");
+        const detailBefore = await callTaskDetailApi();
+        const statusBefore = extractTaskStatus(detailBefore);
+        const baseBefore = extractTaskServiceBaseUrl(detailBefore);
+        if (baseBefore) {
+          updateServiceLink(baseBefore);
+        } else if (launcherConfig.apiBase) {
+          updateServiceLink(launcherConfig.apiBase);
+        }
+
+        if (isRunningStatus(statusBefore)) {
+          appendLog(`task already running (${statusBefore})`);
+          setStatus("任务已在运行，正在等待服务就绪...", "loading");
+        } else {
+          appendLog(`task status=${statusBefore || "unknown"}, sending recover`);
+          setStatus("任务未运行，正在恢复任务...", "loading");
+          await callTaskControlApi("recover");
+        }
+
+        state.pauseOnUnload = true;
+        appendLog("waiting for worker ready");
+        const base = await waitForWorkerReady();
+        updateServiceLink(base);
+        setStatus("任务就绪，正在进入应用...", "ok");
+        appendLog(`ready: ${base}`);
+        await sleep(auto ? 600 : 300);
+        openApp(base);
+      } catch (error) {
+        const message = error && error.message ? error.message : String(error);
+        setStatus(`启动失败：${message}`, "error");
+        appendLog(`failed: ${message}`);
+        startBtn.disabled = false;
+        pauseBtn.disabled = false;
+      } finally {
+        state.recovering = false;
+      }
+    };
+
+    const pauseTask = async () => {
+      pauseBtn.disabled = true;
+      startBtn.disabled = true;
+      setStatus("正在暂停任务...", "loading");
+      try {
+        await callTaskControlApi("pause");
+        state.pauseOnUnload = false;
+        setStatus("任务已暂停。", "warn");
+        appendLog("task paused");
+      } catch (error) {
+        const message = error && error.message ? error.message : String(error);
+        setStatus(`暂停失败：${message}`, "error");
+        appendLog(`pause failed: ${message}`);
+      } finally {
+        pauseBtn.disabled = false;
+        startBtn.disabled = false;
+      }
+    };
+
+    const normalizeBase = (value) => String(value || "").trim().replace(/\/$/, "");
+
+    const applyQueryOverrides = () => {
+      const qs = new URLSearchParams(window.location.search);
+      const taskId = qs.get("task_id");
+      const servicePort = qs.get("service_port");
+      const token = qs.get("token");
+      const openApiBase = qs.get("openapi_base");
+      const apiBase = qs.get("api_base") || qs.get("apibase");
+
+      if (taskId) {
+        launcherConfig.taskId = Number(taskId) || taskId;
+      }
+      if (servicePort) {
+        launcherConfig.servicePort = Number(servicePort) || launcherConfig.servicePort;
+      }
+      if (token) {
+        launcherConfig.token = token;
+      }
+      if (openApiBase) {
+        launcherConfig.openApiBase = normalizeBase(openApiBase);
+      }
+      if (apiBase) {
+        launcherConfig.apiBase = normalizeBase(apiBase);
+      }
+      state.runtimeApiBase = launcherConfig.apiBase;
+    };
+
+    const pauseOnUnload = () => {
+      if (!state.pauseOnUnload || !launcherConfig.token) {
+        return;
+      }
+      try {
+        fetch(`${launcherConfig.openApiBase}/api/deployment/task/pause`, {
+          method: "POST",
+          headers: buildOpenApiHeaders(),
+          body: JSON.stringify({ task_id: launcherConfig.taskId }),
+          keepalive: true,
+        });
+      } catch (error) {
+        // best-effort only
+      }
+    };
+
+    const renderMeta = () => {
+      document.getElementById("meta-task-id").textContent = String(launcherConfig.taskId);
+      document.getElementById("meta-service-port").textContent = String(launcherConfig.servicePort);
+      document.getElementById("meta-api-base").textContent = launcherConfig.apiBase;
+      document.getElementById("meta-timeout").textContent = `${Math.floor(launcherConfig.readyTimeoutMs / 1000)}s`;
+    };
+
+    startBtn.addEventListener("click", () => startWorkflow(false));
+    pauseBtn.addEventListener("click", pauseTask);
+    window.addEventListener("pagehide", pauseOnUnload);
+    window.addEventListener("beforeunload", pauseOnUnload);
+
+    applyQueryOverrides();
+    if (launcherConfig.apiBase) {
+      updateServiceLink(launcherConfig.apiBase);
+    }
+    appendLog(`api_base=${launcherConfig.apiBase}`);
+    appendLog(`openapi_base=${launcherConfig.openApiBase}`);
+    renderMeta();
+    appendLog("launcher initialized");
+    if (launcherConfig.autoStart && !state.autoStarted) {
+      state.autoStarted = true;
+      startWorkflow(true);
+    }
+  </script>
+</body>
+</html>

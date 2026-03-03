@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 import io
 import sys
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -25,7 +25,7 @@ import requests
 import spaces
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pillow_heif import register_heif_opener
@@ -98,6 +98,211 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+class ReconstructionQueueManager:
+    """Global reconstruction queue: one running job, remaining jobs wait in order."""
+
+    _TERMINAL_STATES = {"completed", "failed", "cancelled"}
+
+    def __init__(self, stale_wait_timeout_sec: int = 300) -> None:
+        self._stale_wait_timeout_sec = max(30, int(stale_wait_timeout_sec))
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._waiting_job_ids: list[str] = []
+        self._running_job_id: str | None = None
+        self._jobs: dict[str, dict] = {}
+        self._job_counter = 0
+
+    def _cleanup_stale_waiting_locked(self, now: float) -> None:
+        stale_job_ids: list[str] = []
+        for job_id in list(self._waiting_job_ids):
+            job = self._jobs.get(job_id)
+            if not job:
+                stale_job_ids.append(job_id)
+                continue
+            last_touch = float(job.get("last_touch", job.get("created_at", now)))
+            if (now - last_touch) > self._stale_wait_timeout_sec:
+                job["state"] = "cancelled"
+                job["ended_at"] = now
+                job["error_message"] = "queue timeout"
+                stale_job_ids.append(job_id)
+        if stale_job_ids:
+            stale_set = set(stale_job_ids)
+            self._waiting_job_ids = [job_id for job_id in self._waiting_job_ids if job_id not in stale_set]
+
+    def _status_snapshot_locked(self, job_id: str) -> dict:
+        job = self._jobs.get(job_id)
+        if not job:
+            return {
+                "job_id": job_id,
+                "state": "missing",
+                "waiting_before": 0,
+                "waiting_jobs": len(self._waiting_job_ids),
+                "running": bool(self._running_job_id),
+                "running_job_id": self._running_job_id,
+            }
+
+        state = str(job.get("state", "missing"))
+        waiting_before = 0
+        if state == "waiting":
+            try:
+                waiting_before = self._waiting_job_ids.index(job_id)
+            except ValueError:
+                waiting_before = 0
+
+        return {
+            "job_id": job_id,
+            "state": state,
+            "waiting_before": waiting_before,
+            "waiting_jobs": len(self._waiting_job_ids),
+            "running": bool(self._running_job_id),
+            "running_job_id": self._running_job_id,
+            "session_hash": str(job.get("session_hash", "")),
+            "created_at": float(job.get("created_at", 0.0)),
+            "started_at": float(job.get("started_at", 0.0)),
+            "ended_at": float(job.get("ended_at", 0.0)),
+            "error_message": str(job.get("error_message", "")),
+        }
+
+    def enqueue(self, session_hash: str) -> tuple[str, dict]:
+        now = time.time()
+        normalized_session = str(session_hash or "").strip()
+        with self._condition:
+            self._cleanup_stale_waiting_locked(now)
+            self._job_counter += 1
+            job_id = f"recon-{self._job_counter}"
+            self._jobs[job_id] = {
+                "job_id": job_id,
+                "state": "waiting",
+                "session_hash": normalized_session,
+                "created_at": now,
+                "started_at": 0.0,
+                "ended_at": 0.0,
+                "last_touch": now,
+                "error_message": "",
+            }
+            self._waiting_job_ids.append(job_id)
+            snapshot = self._status_snapshot_locked(job_id)
+            self._condition.notify_all()
+            return job_id, snapshot
+
+    def get_status(self, job_id: str) -> dict:
+        normalized_job_id = str(job_id or "").strip()
+        with self._condition:
+            now = time.time()
+            self._cleanup_stale_waiting_locked(now)
+            job = self._jobs.get(normalized_job_id)
+            if job and str(job.get("state")) not in self._TERMINAL_STATES:
+                job["last_touch"] = now
+            return self._status_snapshot_locked(normalized_job_id)
+
+    def summary(self) -> dict:
+        with self._condition:
+            self._cleanup_stale_waiting_locked(time.time())
+            return {
+                "running": bool(self._running_job_id),
+                "running_job_id": self._running_job_id,
+                "waiting_jobs": len(self._waiting_job_ids),
+                "total_jobs": len(self._jobs),
+            }
+
+    def wait_for_turn(self, job_id: str, poll_interval_sec: float = 1.0) -> dict:
+        normalized_job_id = str(job_id or "").strip()
+        poll_interval_sec = max(0.2, float(poll_interval_sec))
+
+        with self._condition:
+            while True:
+                now = time.time()
+                self._cleanup_stale_waiting_locked(now)
+                job = self._jobs.get(normalized_job_id)
+                if not job:
+                    return self._status_snapshot_locked(normalized_job_id)
+
+                state = str(job.get("state"))
+                if state in self._TERMINAL_STATES:
+                    return self._status_snapshot_locked(normalized_job_id)
+
+                if (
+                    self._running_job_id is None
+                    and self._waiting_job_ids
+                    and self._waiting_job_ids[0] == normalized_job_id
+                ):
+                    self._waiting_job_ids.pop(0)
+                    self._running_job_id = normalized_job_id
+                    job["state"] = "running"
+                    job["started_at"] = now
+                    job["last_touch"] = now
+                    self._condition.notify_all()
+                    return self._status_snapshot_locked(normalized_job_id)
+
+                job["last_touch"] = now
+                self._condition.wait(timeout=poll_interval_sec)
+
+    def complete(self, job_id: str, success: bool, error_message: str = "") -> None:
+        normalized_job_id = str(job_id or "").strip()
+        with self._condition:
+            job = self._jobs.get(normalized_job_id)
+            if not job:
+                return
+            now = time.time()
+            if self._running_job_id == normalized_job_id:
+                self._running_job_id = None
+            if str(job.get("state")) not in self._TERMINAL_STATES:
+                job["state"] = "completed" if success else "failed"
+                job["ended_at"] = now
+                job["error_message"] = str(error_message or "")
+            job["last_touch"] = now
+            self._condition.notify_all()
+
+    def cancel(self, job_id: str, reason: str = "") -> None:
+        normalized_job_id = str(job_id or "").strip()
+        with self._condition:
+            job = self._jobs.get(normalized_job_id)
+            if not job:
+                return
+            now = time.time()
+            if self._running_job_id == normalized_job_id:
+                self._running_job_id = None
+            self._waiting_job_ids = [
+                queued_job_id for queued_job_id in self._waiting_job_ids if queued_job_id != normalized_job_id
+            ]
+            if str(job.get("state")) not in self._TERMINAL_STATES:
+                job["state"] = "cancelled"
+                job["ended_at"] = now
+                job["error_message"] = str(reason or "")
+            job["last_touch"] = now
+            self._condition.notify_all()
+
+
+RECONSTRUCTION_QUEUE = ReconstructionQueueManager(
+    stale_wait_timeout_sec=_env_int("RECON_QUEUE_STALE_TIMEOUT_SEC", 300)
+)
+
+
+def _format_reconstruction_queue_status(status: dict) -> str:
+    state = str(status.get("state", "missing"))
+    waiting_before = int(status.get("waiting_before", 0))
+    waiting_jobs = int(status.get("waiting_jobs", 0))
+    running = bool(status.get("running", False))
+
+    if state == "waiting":
+        running_text = "，当前有 1 个任务正在执行" if running else ""
+        return f"重建任务排队中：前方有 {waiting_before} 个任务正在排队{running_text}。"
+    if state == "running":
+        return "重建任务执行中：你的任务正在处理。"
+    if state == "completed":
+        return "重建任务已完成。"
+    if state == "failed":
+        message = str(status.get("error_message", "")).strip()
+        return f"重建任务失败：{message}" if message else "重建任务失败。"
+    if state == "cancelled":
+        message = str(status.get("error_message", "")).strip()
+        return f"重建任务已取消：{message}" if message else "重建任务已取消。"
+    if waiting_jobs > 0 or running:
+        running_text = "，当前有 1 个任务正在执行" if running else ""
+        return f"队列繁忙：等待中任务 {waiting_jobs} 个{running_text}。"
+    return "重建队列空闲。"
+
+
 class PlatformTaskManager:
     """Manage task lifecycle against Suanli OpenAPI based on browser presence."""
 
@@ -114,17 +319,17 @@ class PlatformTaskManager:
         self.openapi_base = os.getenv("PLATFORM_OPENAPI_BASE", "https://openapi.suanli.cn").rstrip("/")
         self.api_version = os.getenv("PLATFORM_API_VERSION", "1.0.0").strip() or "1.0.0"
         # Use env vars first; fallback to current deployment values for quick setup.
-        self.task_id = (os.getenv("PLATFORM_TASK_ID") or "1558859").strip()
+        self.task_id = (os.getenv("PLATFORM_TASK_ID") or "1554725").strip()
         self.service_port = _env_int("PLATFORM_SERVICE_PORT", 10085)
         self.token = (
             os.getenv("PLATFORM_TOKEN")
             or "f2ee1c4c-b678-4b3e-850b-e56a6f57bfd3-20260208093806"
         ).strip()
         self.heartbeat_interval_sec = _env_int("PLATFORM_HEARTBEAT_INTERVAL_SEC", 20)
-        self.heartbeat_timeout_sec = _env_int("PLATFORM_HEARTBEAT_TIMEOUT_SEC", 90)
+        self.heartbeat_timeout_sec = _env_int("PLATFORM_HEARTBEAT_TIMEOUT_SEC", 45)
         self.monitor_interval_sec = _env_int("PLATFORM_MONITOR_INTERVAL_SEC", 5)
         self.status_check_interval_sec = _env_int("PLATFORM_STATUS_CHECK_INTERVAL_SEC", 30)
-        self.idle_pause_grace_sec = _env_int("PLATFORM_IDLE_PAUSE_GRACE_SEC", 120)
+        self.idle_pause_grace_sec = _env_int("PLATFORM_IDLE_PAUSE_GRACE_SEC", 30)
 
         self.enabled = bool(self.task_id and self.token)
         self._lock = threading.Lock()
@@ -216,6 +421,22 @@ class PlatformTaskManager:
     }
   };
 
+  const sendDisconnectBeacon = (payload) => {
+    if (!navigator || typeof navigator.sendBeacon !== "function") {
+      return false;
+    }
+    const clientId = payload && payload.client_id ? String(payload.client_id) : "";
+    if (!clientId) {
+      return false;
+    }
+    try {
+      const url = "/platform/disconnect-beacon?client_id=" + encodeURIComponent(clientId);
+      return navigator.sendBeacon(url);
+    } catch (error) {
+      return false;
+    }
+  };
+
   const disconnect = (isUnload) => {
     if (!state.enabled || !state.clientId || state.disconnecting) {
       return;
@@ -225,9 +446,21 @@ class PlatformTaskManager:
       window.clearInterval(state.heartbeatTimer);
       state.heartbeatTimer = null;
     }
+    const payload = { client_id: state.clientId };
+    if (isUnload) {
+      sendDisconnectBeacon(payload);
+      try {
+        fetch(
+          "/platform/disconnect-ping?client_id=" + encodeURIComponent(state.clientId),
+          { method: "GET", cache: "no-store", keepalive: true }
+        ).catch(() => {});
+      } catch (error) {
+        // Ignore unload transport errors.
+      }
+    }
     postJson(
       "/platform/disconnect",
-      { client_id: state.clientId },
+      payload,
       Boolean(isUnload)
     ).catch(() => {});
   };
@@ -257,6 +490,7 @@ class PlatformTaskManager:
       });
       window.addEventListener("pagehide", () => disconnect(true));
       window.addEventListener("beforeunload", () => disconnect(true));
+      window.addEventListener("unload", () => disconnect(true));
     } catch (error) {
       // Browser-side lifecycle support is best-effort.
     }
@@ -535,6 +769,7 @@ class PlatformTaskManager:
             self._prune_stale_clients_locked(time.time())
             has_clients = len(self._active_clients) > 0
         if pause_if_idle and not has_clients:
+            print(f"[platform] last active client disconnected: client_id={client_id}, pausing task")
             self.pause_task()
         return self.status_snapshot()
 
@@ -544,13 +779,20 @@ class PlatformTaskManager:
                 active_count = self._active_client_count()
                 if active_count == 0:
                     now = time.time()
-                    should_pause = False
                     with self._lock:
                         idle_ref = max(self._last_recover_ts, self._last_client_activity_ts)
                         idle_sec = now - idle_ref if idle_ref > 0 else now
-                        should_pause = self._task_running and idle_sec >= self.idle_pause_grace_sec
-                    if should_pause:
-                        self.pause_task()
+                        should_check_pause = idle_sec >= self.idle_pause_grace_sec
+                    if should_check_pause:
+                        runtime = self.sync_task_state()
+                        if runtime.get("task_running"):
+                            print(
+                                f"[platform] no active clients for {idle_sec:.1f}s, pausing task"
+                            )
+                            self.pause_task()
+                        else:
+                            with self._lock:
+                                self._task_running = False
                     continue
 
                 now = time.time()
@@ -982,8 +1224,53 @@ def prepare_visualization_data(
 
     return visualization_dict
 
+def _empty_reconstruction_response(message: str, terminal_log: str):
+    return (
+        None,
+        message,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        terminal_log,
+    )
+
+
+def enqueue_reconstruction_job(request: gr.Request | None = None):
+    session_hash = str(getattr(request, "session_hash", "") or "").strip()
+    job_id, status = RECONSTRUCTION_QUEUE.enqueue(session_hash)
+    queue_message = _format_reconstruction_queue_status(status)
+    log_message = f"已提交重建任务（{job_id}）。{queue_message}"
+    return job_id, queue_message, log_message
+
+
+def get_reconstruction_queue_status(job_id: str):
+    normalized_job_id = str(job_id or "").strip()
+    if normalized_job_id:
+        return _format_reconstruction_queue_status(
+            RECONSTRUCTION_QUEUE.get_status(normalized_job_id)
+        )
+
+    summary = RECONSTRUCTION_QUEUE.summary()
+    waiting_jobs = int(summary.get("waiting_jobs", 0))
+    running = bool(summary.get("running", False))
+    if waiting_jobs > 0 or running:
+        running_text = "，当前有 1 个任务正在执行" if running else ""
+        return f"队列繁忙：等待中任务 {waiting_jobs} 个{running_text}。"
+    return "重建队列空闲。"
+
+
 @spaces.GPU(duration=120)
 def gradio_demo(
+    job_id,
     target_dir,
     frame_selector="All",
     show_camera=False,
@@ -994,22 +1281,58 @@ def gradio_demo(
     """
     Perform reconstruction using the already-created target_dir/images.
     """
-    # Capture terminal output
+    normalized_job_id = str(job_id or "").strip()
+
     tee = TeeOutput()
     old_stdout = sys.stdout
     sys.stdout = tee
-    
+
+    job_claimed = False
+    job_finalized = False
+    failure_reason = ""
+
     try:
-        if not os.path.isdir(target_dir) or target_dir == "None":
+        print(
+            f"[reconstruct] request received: job_id={normalized_job_id}, target_dir={target_dir}"
+        )
+        if not normalized_job_id:
+            failure_reason = "missing queue job id"
             terminal_log = tee.getvalue()
-            sys.stdout = old_stdout
-            return None, "No valid target directory found. Please upload first.", None, None, None, None, None, None, None, None, None, None, None, None, terminal_log
+            return _empty_reconstruction_response(
+                "No valid reconstruction queue job found. Please click Reconstruct again.",
+                terminal_log,
+            )
+
+        if not os.path.isdir(target_dir) or target_dir == "None":
+            failure_reason = "invalid target directory"
+            RECONSTRUCTION_QUEUE.cancel(normalized_job_id, reason=failure_reason)
+            job_finalized = True
+            terminal_log = tee.getvalue()
+            return _empty_reconstruction_response(
+                "No valid target directory found. Please upload first.",
+                terminal_log,
+            )
+
+        waiting_snapshot = RECONSTRUCTION_QUEUE.wait_for_turn(normalized_job_id)
+        if waiting_snapshot.get("state") != "running":
+            failure_reason = f"job unavailable: {waiting_snapshot.get('state', 'unknown')}"
+            RECONSTRUCTION_QUEUE.cancel(normalized_job_id, reason=failure_reason)
+            job_finalized = True
+            terminal_log = tee.getvalue()
+            return _empty_reconstruction_response(
+                "Reconstruction queue job is unavailable. Please submit again.",
+                terminal_log,
+            )
+
+        job_claimed = True
+        print(
+            f"[reconstruct] job started: job_id={normalized_job_id}"
+        )
 
         start_time = time.time()
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Prepare frame_selector dropdown
         target_dir_images = os.path.join(target_dir, "images")
         all_files = (
             sorted(os.listdir(target_dir_images))
@@ -1023,55 +1346,52 @@ def gradio_demo(
         with torch.no_grad():
             predictions, processed_data = run_model(target_dir)
 
-        # Save predictions
         prediction_save_path = os.path.join(target_dir, "predictions.npz")
         np.savez(prediction_save_path, **predictions)
 
-        # Save camera parameters as JSON
         camera_params_file = save_camera_params(
-            predictions['camera_poses'], 
-            predictions['camera_intrs'], 
-            target_dir
+            predictions["camera_poses"],
+            predictions["camera_intrs"],
+            target_dir,
         )
 
-        # Handle None frame_selector
         if frame_selector is None:
             frame_selector = "All"
 
-        # Build a GLB file name
         glbfile = os.path.join(
             target_dir,
             f"glbscene_{frame_selector.replace('.', '_').replace(':', '').replace(' ', '_')}_cam{show_camera}_mesh{show_mesh}.glb",
         )
 
-        # Convert predictions to GLB
         glbscene = convert_predictions_to_glb_scene(
             predictions,
             filter_by_frames=frame_selector,
             show_camera=show_camera,
             mask_sky_bg=filter_sky_bg,
-            as_mesh=show_mesh,  # Use the show_mesh parameter
-            mask_ambiguous=filter_ambiguous
+            as_mesh=show_mesh,
+            mask_ambiguous=filter_ambiguous,
         )
         glbscene.export(file_obj=glbfile)
-        
+
         end_time = time.time()
         print(f"Total time: {end_time - start_time:.2f} seconds")
         log_msg = (
             f"Reconstruction Success ({len(all_files)} frames). Waiting for visualization."
         )
-        # Convert predictions to 3dgs ply
+
         gs_file = None
-        splat_mode = 'ply'
+        splat_mode = "ply"
         if "splats" in predictions:
-            # Get Gaussian parameters (already filtered by GaussianSplatRenderer)
             means = predictions["splats"]["means"][0].reshape(-1, 3)
             scales = predictions["splats"]["scales"][0].reshape(-1, 3)
             quats = predictions["splats"]["quats"][0].reshape(-1, 4)
-            colors = (predictions["splats"]["sh"][0] if "sh" in predictions["splats"] else predictions["splats"]["colors"][0]).reshape(-1, 3)
+            colors = (
+                predictions["splats"]["sh"][0]
+                if "sh" in predictions["splats"]
+                else predictions["splats"]["colors"][0]
+            ).reshape(-1, 3)
             opacities = predictions["splats"]["opacities"][0].reshape(-1)
-            
-            # Convert to torch tensors if needed
+
             if not isinstance(means, torch.Tensor):
                 means = torch.from_numpy(means)
             if not isinstance(scales, torch.Tensor):
@@ -1082,8 +1402,8 @@ def gradio_demo(
                 colors = torch.from_numpy(colors)
             if not isinstance(opacities, torch.Tensor):
                 opacities = torch.from_numpy(opacities)
-            
-            if splat_mode == 'ply':
+
+            if splat_mode == "ply":
                 gs_file = os.path.join(target_dir, "gaussians.ply")
                 save_gs_ply(
                     gs_file,
@@ -1091,84 +1411,73 @@ def gradio_demo(
                     scales,
                     quats,
                     colors,
-                    opacities
+                    opacities,
                 )
                 print(f"Saved Gaussian Splatting PLY to: {gs_file}")
                 print(f"File exists: {os.path.exists(gs_file)}")
                 if os.path.exists(gs_file):
                     print(f"File size: {os.path.getsize(gs_file)} bytes")
-            elif splat_mode == 'splat':
-                # Save Gaussian splat
+            elif splat_mode == "splat":
                 plydata = convert_gs_to_ply(
-                        means,
-                        scales,
-                        quats,
-                        colors,
-                        opacities
-                    )
+                    means,
+                    scales,
+                    quats,
+                    colors,
+                    opacities,
+                )
                 gs_file = os.path.join(target_dir, "gaussians.splat")
                 gs_file = process_ply_to_splat(plydata, gs_file)
 
-        # Initialize depth and normal view displays with processed data
-        depth_vis, normal_vis = initialize_depth_normal_views(
-            processed_data
-        )
-
-        # Update view selectors and info displays based on available views
+        depth_vis, normal_vis = initialize_depth_normal_views(processed_data)
         depth_slider, normal_slider, depth_info, normal_info = update_view_selectors(
             processed_data
         )
 
-        # Automatically generate render video
-        # Generate render video if possible
         rgb_video_path = None
         depth_video_path = None
-        
         if "splats" in predictions:
-            # try:
             from pathlib import Path
-            
+
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            # Get camera parameters and image dimensions
-            camera_poses = torch.tensor(predictions['camera_poses']).unsqueeze(0).to(device)
-            camera_intrs = torch.tensor(predictions['camera_intrs']).unsqueeze(0).to(device)
-            H, W = predictions['images'].shape[1], predictions['images'].shape[2]
-            
-            # Render video
+            camera_poses = torch.tensor(predictions["camera_poses"]).unsqueeze(0).to(device)
+            camera_intrs = torch.tensor(predictions["camera_intrs"]).unsqueeze(0).to(device)
+            H, W = predictions["images"].shape[1], predictions["images"].shape[2]
+
             out_path = Path(target_dir) / "rendered_video"
             render_interpolated_video(
-                model.gs_renderer, 
-                predictions["splats"], 
-                camera_poses, 
-                camera_intrs, 
-                (H, W), 
-                out_path, 
-                interp_per_pair=15, 
+                model.gs_renderer,
+                predictions["splats"],
+                camera_poses,
+                camera_intrs,
+                (H, W),
+                out_path,
+                interp_per_pair=15,
                 loop_reverse=True,
-                save_mode="split"
+                save_mode="split",
             )
-            
-            # Check output files
+
             rgb_video_path = str(out_path) + "_rgb.mp4"
             depth_video_path = str(out_path) + "_depth.mp4"
-            
             if not os.path.exists(rgb_video_path) and not os.path.exists(depth_video_path):
                 rgb_video_path = None
                 depth_video_path = None
-                
-        # Cleanup
+
         del predictions
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Get terminal output and restore stdout
-        terminal_log = tee.getvalue()
-        sys.stdout = old_stdout
+        RECONSTRUCTION_QUEUE.complete(normalized_job_id, success=True)
+        job_finalized = True
 
+        terminal_log = tee.getvalue()
         return (
             glbfile,
             log_msg,
-            gr.Dropdown(choices=frame_selector_choices, value=frame_selector, interactive=True),
+            gr.Dropdown(
+                choices=frame_selector_choices,
+                value=frame_selector,
+                interactive=True,
+            ),
             processed_data,
             depth_vis,
             normal_vis,
@@ -1182,13 +1491,24 @@ def gradio_demo(
             depth_video_path,
             terminal_log,
         )
-    
     except Exception as e:
-        # In case of error, still restore stdout
-        terminal_log = tee.getvalue()
-        sys.stdout = old_stdout
+        failure_reason = str(e)
         print(f"Error occurred: {e}")
         raise
+    finally:
+        if not job_finalized:
+            if job_claimed:
+                RECONSTRUCTION_QUEUE.complete(
+                    normalized_job_id,
+                    success=False,
+                    error_message=failure_reason or "reconstruction failed",
+                )
+            elif normalized_job_id:
+                RECONSTRUCTION_QUEUE.cancel(
+                    normalized_job_id,
+                    reason=failure_reason or "request cancelled",
+                )
+        sys.stdout = old_stdout
 
 
 # -------------------------------------------------------------------------
@@ -1484,6 +1804,7 @@ with gr.Blocks(
     # State variables for the tabbed interface
     is_example = gr.Textbox(label="is_example", visible=False, value="False")
     processed_data_state = gr.State(value=None)
+    reconstruct_job_state = gr.State(value="")
 
     # Header
     gr.HTML(
@@ -1548,6 +1869,9 @@ with gr.Blocks(
             log_output = gr.Markdown(
                 "Upload video or images first, then click Reconstruct to start processing",
                 elem_classes=["custom-log"],
+            )
+            queue_status_output = gr.Markdown(
+                "重建队列空闲。",
             )
 
             with gr.Tabs() as tabs:
@@ -1645,6 +1969,7 @@ with gr.Blocks(
                         file_upload,
                         reconstruction_output,
                         log_output,
+                        queue_status_output,
                         output_path_state,
                         image_gallery,
                         depth_map,
@@ -1676,11 +2001,17 @@ with gr.Blocks(
     # -------------------------------------------------------------------------
     # Click logic
     # -------------------------------------------------------------------------
-    reconstruct_btn.click(fn=clear_fields, inputs=[], outputs=[]).then(
-        fn=update_log, inputs=[], outputs=[log_output]
+    reconstruct_btn.click(fn=clear_fields, inputs=[], outputs=[], queue=False).then(
+        fn=update_log, inputs=[], outputs=[log_output], queue=False
+    ).then(
+        fn=enqueue_reconstruction_job,
+        inputs=[],
+        outputs=[reconstruct_job_state, queue_status_output, log_output],
+        queue=False,
     ).then(
         fn=gradio_demo,
         inputs=[
+            reconstruct_job_state,
             output_path_state,
             frame_selector,
             show_camera,
@@ -1709,6 +2040,14 @@ with gr.Blocks(
         fn=lambda: "False",
         inputs=[],
         outputs=[is_example],  # set is_example to "False"
+        queue=False,
+    )
+
+    clear_btn.click(
+        fn=lambda: ("", "重建队列空闲。"),
+        inputs=[],
+        outputs=[reconstruct_job_state, queue_status_output],
+        queue=False,
     )
 
     # -------------------------------------------------------------------------
@@ -2159,11 +2498,20 @@ with gr.Blocks(
     # Real-time terminal output update
     # -------------------------------------------------------------------------
     # Use a timer to periodically update terminal output
-    timer = gr.Timer(value=0.5)  # Update every 0.5 seconds
+    timer = gr.Timer(value=2.0)  # Avoid queue flooding from high-frequency polling
     timer.tick(
         fn=get_terminal_output,
         inputs=[],
-        outputs=[terminal_output]
+        outputs=[terminal_output],
+        queue=False,
+    )
+
+    queue_timer = gr.Timer(value=1.0)
+    queue_timer.tick(
+        fn=get_reconstruction_queue_status,
+        inputs=[reconstruct_job_state],
+        outputs=[queue_status_output],
+        queue=False,
     )
     
 class PlatformClientPayload(BaseModel):
@@ -2177,6 +2525,25 @@ def _validate_client_id(client_id: str) -> str:
     if len(normalized) > 128:
         raise HTTPException(status_code=400, detail="client_id is too long")
     return normalized
+
+
+def _extract_client_id_from_raw_body(raw_body: bytes) -> str:
+    if not raw_body:
+        return ""
+    text = raw_body.decode("utf-8", errors="ignore").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        return str(payload.get("client_id") or "").strip()
+    parsed_qs = parse_qs(text, keep_blank_values=False)
+    values = parsed_qs.get("client_id") or []
+    if values:
+        return str(values[0] or "").strip()
+    return ""
 
 
 def create_fastapi_app(gradio_blocks: gr.Blocks, task_manager: PlatformTaskManager) -> FastAPI:
@@ -2242,6 +2609,54 @@ def create_fastapi_app(gradio_blocks: gr.Blocks, task_manager: PlatformTaskManag
             raise HTTPException(status_code=500, detail=f"platform disconnect failed: {exc}")
         return snapshot
 
+    @api.get("/platform/disconnect-ping")
+    def platform_disconnect_ping(client_id: str):
+        if not task_manager.enabled:
+            return {"enabled": False}
+        normalized_client_id = _validate_client_id(client_id)
+        try:
+            snapshot = task_manager.disconnect_client(
+                normalized_client_id,
+                pause_if_idle=True,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"platform disconnect ping failed: {exc}",
+            )
+        return snapshot
+
+    @api.post("/platform/disconnect-beacon")
+    async def platform_disconnect_beacon(request: Request, client_id: str = ""):
+        if not task_manager.enabled:
+            return {"enabled": False}
+
+        normalized_client_id = str(client_id or "").strip()
+        if not normalized_client_id:
+            try:
+                payload = await request.json()
+            except Exception:
+                payload = None
+
+            if isinstance(payload, dict):
+                normalized_client_id = str(payload.get("client_id") or "").strip()
+            if not normalized_client_id:
+                raw_body = await request.body()
+                normalized_client_id = _extract_client_id_from_raw_body(raw_body)
+
+        normalized_client_id = _validate_client_id(normalized_client_id)
+        try:
+            snapshot = task_manager.disconnect_client(
+                normalized_client_id,
+                pause_if_idle=True,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"platform disconnect beacon failed: {exc}",
+            )
+        return snapshot
+
     @api.get("/platform/status")
     def platform_status(refresh: bool = False):
         snapshot = task_manager.status_snapshot()
@@ -2255,10 +2670,17 @@ def create_fastapi_app(gradio_blocks: gr.Blocks, task_manager: PlatformTaskManag
             raise HTTPException(status_code=500, detail=f"platform status refresh failed: {exc}")
         return {**snapshot, **runtime}
 
+    @api.get("/platform/reconstruct-queue")
+    def platform_reconstruct_queue(job_id: str | None = None):
+        normalized_job_id = str(job_id or "").strip()
+        if normalized_job_id:
+            return RECONSTRUCTION_QUEUE.get_status(normalized_job_id)
+        return RECONSTRUCTION_QUEUE.summary()
+
     return gr.mount_gradio_app(api, gradio_blocks, path="/")
 
 
-queued_demo = demo.queue()
+queued_demo = demo.queue(default_concurrency_limit=16, max_size=256)
 app = create_fastapi_app(queued_demo, PLATFORM_TASK_MANAGER)
 PLATFORM_TASK_MANAGER.start()
 
