@@ -1,8 +1,8 @@
-# HunyuanWorld-Mirror API
+# kokoni-3d-world API
 
 ## 1. 接入概览
 
-HunyuanWorld-Mirror 采用异步任务模式：
+`kokoni-3d-world` 采用异步任务模式：
 
 1. 提交重建任务
 2. 获取 `task_id`
@@ -57,7 +57,7 @@ POST http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstructio
 
 ```json
 {
-  "model": "hunyuanworld-mirror",
+  "model": "kokoni-3d-world",
   "input": {
     "request_id": "optional-client-id",
     "frame_selector": "All"
@@ -76,7 +76,7 @@ POST http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstructio
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `model` | string | 是 | 模型名称，当前使用 `hunyuanworld-mirror` |
+| `model` | string | 是 | 模型名称，当前使用 `kokoni-3d-world` |
 | `input` | object | 是 | 输入参数 |
 | `parameters` | object | 是 | 控制参数 |
 
@@ -103,7 +103,7 @@ POST http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstructio
 curl --location 'http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstruction' \
   -H 'Authorization: Bearer <YOUR_API_KEY>' \
   -F 'request={
-    "model":"hunyuanworld-mirror",
+    "model":"kokoni-3d-world",
     "input":{
       "request_id":"req-001",
       "frame_selector":"All"
