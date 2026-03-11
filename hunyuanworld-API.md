@@ -11,27 +11,33 @@ HunyuanWorld-Mirror 采用异步任务模式：
 
 ## 2. 服务地址
 
-请将以下地址中的 `<base_url>` 替换为实际分配给您的服务入口，例如：
+当前服务地址（下文中的 `base_url`）：
 
 ```text
-http://<your-host>:8090
+http://36.133.236.108:8090
 ```
 
-本文档中的所有接口都以 `<base_url>` 为前缀。
+## 3. 鉴权
 
-## 3. 接口清单
+API 使用 **Bearer Token** 机制进行访问控制。客户端需要在 Header 中传递 `Authorization` 字段。
+
+| Header Field | Value Format | 说明 |
+|---|---|---|
+| `Authorization` | `Bearer <YOUR_API_KEY>` | 请将 `<YOUR_API_KEY>` 替换为实际分配的密钥 |
+
+## 4. 接口清单
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/v1/services/aigc/3d-generation/reconstruction` | 创建重建任务 |
 | `GET` | `/api/v1/tasks/{task_id}` | 查询任务状态与结果 |
 
-## 4. 创建重建任务
+## 5. 创建重建任务
 
 ### 4.1 请求地址
 
 ```text
-POST <base_url>/api/v1/services/aigc/3d-generation/reconstruction
+POST http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstruction
 ```
 
 ### 4.2 请求类型
@@ -94,7 +100,8 @@ POST <base_url>/api/v1/services/aigc/3d-generation/reconstruction
 ### 4.5 请求示例
 
 ```bash
-curl --location '<base_url>/api/v1/services/aigc/3d-generation/reconstruction' \
+curl --location 'http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstruction' \
+  -H 'Authorization: Bearer <YOUR_API_KEY>' \
   -F 'request={
     "model":"hunyuanworld-mirror",
     "input":{
@@ -129,12 +136,12 @@ curl --location '<base_url>/api/v1/services/aigc/3d-generation/reconstruction' \
 }
 ```
 
-## 5. 查询任务状态
+## 6. 查询任务状态
 
 ### 5.1 请求地址
 
 ```text
-GET <base_url>/api/v1/tasks/{task_id}
+GET http://36.133.236.108:8090/api/v1/tasks/{task_id}
 ```
 
 ### 5.2 路径参数
@@ -194,7 +201,8 @@ GET <base_url>/api/v1/tasks/{task_id}
 ### 5.5 查询示例
 
 ```bash
-curl --location '<base_url>/api/v1/tasks/7d7d5167b6d4498ebad79dc58e11e4f7'
+curl --location 'http://36.133.236.108:8090/api/v1/tasks/7d7d5167b6d4498ebad79dc58e11e4f7' \
+  -H 'Authorization: Bearer <YOUR_API_KEY>'
 ```
 
 ### 5.6 成功完成响应示例
@@ -226,7 +234,7 @@ curl --location '<base_url>/api/v1/tasks/7d7d5167b6d4498ebad79dc58e11e4f7'
 }
 ```
 
-## 6. 推荐调用方式
+## 7. 推荐调用方式
 
 建议客户端按以下方式接入：
 
@@ -235,7 +243,7 @@ curl --location '<base_url>/api/v1/tasks/7d7d5167b6d4498ebad79dc58e11e4f7'
 3. 当 `task_status=SUCCEEDED` 时读取结果文件 URL
 4. 当 `task_status=FAILED` 时提示失败原因并决定是否重试
 
-## 7. 错误处理建议
+## 8. 错误处理建议
 
 常见场景如下：
 
@@ -247,7 +255,7 @@ curl --location '<base_url>/api/v1/tasks/7d7d5167b6d4498ebad79dc58e11e4f7'
 | 任务返回 `FAILED` | 展示 `message`，并根据业务决定是否重新提交 |
 | 查询接口返回 `404` | 检查 `task_id` 是否正确 |
 
-## 8. 结果文件说明
+## 9. 结果文件说明
 
 结果中的文件 URL 为可直接访问的下载地址，通常适合以下用途：
 

@@ -709,6 +709,7 @@
   const config = {
     taskManager: "http://36.133.236.108:8090",
     model: "hunyuanworld-mirror",
+    apiKey: "",
     pollMs: 2000,
   };
 
@@ -716,6 +717,7 @@
   if (qs.get("task_manager")) config.taskManager = qs.get("task_manager").replace(/\/$/, "");
   if (qs.get("model")) config.model = qs.get("model");
   else if (qs.get("project")) config.model = qs.get("project");
+  if (qs.get("api_key")) config.apiKey = qs.get("api_key");
 
   // ---- DOM refs ----
   const fileInput = document.getElementById("file-input");
@@ -772,6 +774,12 @@
     logEl.textContent += `[${ts}] ${line}\n`;
     logEl.scrollTop = logEl.scrollHeight;
   };
+
+  const authHeaders = () => (
+    config.apiKey
+      ? { Authorization: `Bearer ${config.apiKey}` }
+      : {}
+  );
 
   const renderGsPreview = async (url) => {
     gsPlaceholder.style.display = "none";
@@ -898,6 +906,7 @@
       `${config.taskManager}/api/v1/services/aigc/3d-generation/reconstruction`,
       {
         method: "POST",
+        headers: authHeaders(),
         body: fd,
       },
     );
@@ -910,6 +919,7 @@
   const loadTask = async (taskId) => {
     const resp = await fetch(`${config.taskManager}/api/v1/tasks/${encodeURIComponent(taskId)}`, {
       cache: "no-store",
+      headers: authHeaders(),
     });
     if (!resp.ok) {
       throw new Error(await readApiError(resp));
