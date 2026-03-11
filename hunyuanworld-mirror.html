@@ -708,14 +708,14 @@
   // ---- Configuration (no secrets) ----
   const config = {
     taskManager: "http://36.133.236.108:8090",
-    project: "hunyuanworld-mirror",
-    readyTimeoutMs: 15 * 60 * 1000,
+    model: "hunyuanworld-mirror",
     pollMs: 2000,
   };
 
   const qs = new URLSearchParams(location.search);
   if (qs.get("task_manager")) config.taskManager = qs.get("task_manager").replace(/\/$/, "");
-  if (qs.get("project")) config.project = qs.get("project");
+  if (qs.get("model")) config.model = qs.get("model");
+  else if (qs.get("project")) config.model = qs.get("project");
 
   // ---- DOM refs ----
   const fileInput = document.getElementById("file-input");
@@ -758,7 +758,6 @@
   // ---- State ----
   let previewUrls = [];
   let resultData = null;
-  let runtimeApiBase = "";
 
   // ---- Helpers ----
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -860,63 +859,77 @@
     }
   });
 
-  // ---- Task manager calls ----
-  const tmRecover = async () => {
-    appendLog("正在请求恢复任务...");
-    const resp = await fetch(`${config.taskManager}/api/task/recover`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project: config.project }),
+  const readApiError = async (resp) => {
+    const ct = resp.headers.get("content-type") || "";
+    if (ct.includes("json")) {
+      const payload = await resp.json();
+      if (payload.message) return payload.message;
+      if (payload.detail) return payload.detail;
+      return JSON.stringify(payload);
+    }
+    return await resp.text();
+  };
+
+  const createTask = async (files) => {
+    const requestId = crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+    const requestPayload = {
+      model: config.model,
+      input: {
+        request_id: requestId,
+        frame_selector: frameSelector.value,
+      },
+      parameters: {
+        time_interval: parseFloat(intervalSlider.value),
+        show_camera: document.getElementById("opt-camera").checked,
+        show_mesh: document.getElementById("opt-mesh").checked,
+        filter_sky_bg: document.getElementById("opt-sky").checked,
+        filter_ambiguous: document.getElementById("opt-ambiguous").checked,
+      },
+    };
+
+    const fd = new FormData();
+    fd.append("request", JSON.stringify(requestPayload));
+    for (const file of files) fd.append("files", file);
+
+    const resp = await fetch(
+      `${config.taskManager}/api/v1/services/aigc/3d-generation/reconstruction`,
+      {
+        method: "POST",
+        body: fd,
+      },
+    );
+    if (!resp.ok) {
+      throw new Error(await readApiError(resp));
+    }
+    return await resp.json();
+  };
+
+  const loadTask = async (taskId) => {
+    const resp = await fetch(`${config.taskManager}/api/v1/tasks/${encodeURIComponent(taskId)}`, {
+      cache: "no-store",
     });
     if (!resp.ok) {
-      const detail = await resp.text();
-      throw new Error(`恢复失败：${detail}`);
+      throw new Error(await readApiError(resp));
     }
-    const data = await resp.json();
-    appendLog(`恢复完成：recovered=${data.recovered}, url=${data.service_url}`);
-    return data;
+    return await resp.json();
   };
 
-  const tmPause = async () => {
-    appendLog("正在请求暂停任务...");
-    try {
-      const resp = await fetch(`${config.taskManager}/api/task/pause`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project: config.project }),
-      });
-      if (resp.ok) {
-        appendLog("任务已暂停。");
-      } else {
-        appendLog(`暂停响应：${resp.status}`);
-      }
-    } catch (e) {
-      appendLog(`暂停出错：${e.message}`);
-    }
-  };
-
-  // ---- Wait for GPU backend health ----
-  const waitForHealth = async (baseUrl) => {
-    const deadline = Date.now() + config.readyTimeoutMs;
-    while (Date.now() < deadline) {
-      try {
-        const r = await fetch(`${baseUrl}/health`, { cache: "no-store" });
-        if (r.ok) return true;
-      } catch (_) {}
-      setStatus("等待 GPU 后端就绪...", "loading");
-      await sleep(config.pollMs);
-    }
-    throw new Error("等待后端就绪超时。");
-  };
-
-  // ---- Queue status polling ----
-  const applyQueueStatus = (qs) => {
-    if (!qs) return;
-    if (qs.status === "processing" || qs.position === 0) {
+  const applyTaskStatus = (output, message = "") => {
+    if (!output) return;
+    const status = output.task_status;
+    if (status === "PENDING") {
+      setStatus("等待可用节点...", "loading");
+    } else if (status === "SCALING") {
+      setStatus(message || "正在扩容并等待节点冷启动...", "loading");
+    } else if (status === "RUNNING") {
       setStatus("重建中，请保持页面开启。", "loading");
-    } else if (qs.status === "pending") {
-      const ahead = Math.max(0, (qs.position || 1) - 1);
-      setStatus(`排队中（前面还有 ${ahead} 个）`, "loading");
+    } else if (status === "SUCCEEDED") {
+      setStatus("重建完成。", "ok");
+    } else if (status === "FAILED") {
+      setStatus(`请求失败：${message || "任务执行失败"}`, "error");
     }
   };
 
@@ -1023,7 +1036,6 @@
   // ---- Clear ----
   const clearAll = () => {
     resultData = null;
-    runtimeApiBase = "";
     fileInput.value = "";
     previewUrls.forEach((u) => URL.revokeObjectURL(u));
     previewUrls = [];
@@ -1081,111 +1093,53 @@
     }
 
     reconstructBtn.disabled = true;
-    let recovered = false;
-    let paused = false;
-    let queueTimer = null;
-    let requestError = null;
 
     try {
-      // 1. Recover task via suanli-task-manager
-      setStatus("正在恢复算力任务...", "loading");
-      const recoverData = await tmRecover();
-      runtimeApiBase = recoverData.service_url.replace(/\/$/, "");
-      recovered = true;
-
-      // 2. Wait for GPU backend /health
-      setStatus("等待 GPU 后端就绪...", "loading");
-      await waitForHealth(runtimeApiBase);
-      appendLog("后端已就绪：" + runtimeApiBase);
-
-      // 3. Build FormData
-      const requestId = crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-      const fd = new FormData();
-      for (const f of files) fd.append("files", f);
-      fd.append("time_interval", intervalSlider.value);
-      fd.append("frame_selector", frameSelector.value);
-      fd.append("show_camera", document.getElementById("opt-camera").checked);
-      fd.append("show_mesh", document.getElementById("opt-mesh").checked);
-      fd.append("filter_sky_bg", document.getElementById("opt-sky").checked);
-      fd.append("filter_ambiguous", document.getElementById("opt-ambiguous").checked);
-      fd.append("request_id", requestId);
-
-      // 4. Start queue status polling
       setStatus("提交重建请求...", "loading");
-      queueTimer = setInterval(async () => {
-        try {
-          const r = await fetch(
-            `${runtimeApiBase}/queue_status?request_id=${encodeURIComponent(requestId)}`,
-            { cache: "no-store" },
-          );
-          if (r.ok) applyQueueStatus(await r.json());
-        } catch (_) {}
-      }, config.pollMs);
-
-      // 5. POST /reconstruct (blocks until done or queued)
-      const resp = await fetch(`${runtimeApiBase}/reconstruct`, {
-        method: "POST",
-        body: fd,
-      });
-
-      clearInterval(queueTimer);
-      queueTimer = null;
-
-      if (!resp.ok) {
-        const ct = resp.headers.get("content-type") || "";
-        let detail = "";
-        if (ct.includes("json")) {
-          const d = await resp.json();
-          detail = d.detail || JSON.stringify(d);
-        } else {
-          detail = await resp.text();
-        }
-        throw new Error(detail || `HTTP ${resp.status}`);
+      const createResp = await createTask(files);
+      const requestId = createResp.request_id || "";
+      const taskId = createResp.output?.task_id;
+      if (!taskId) {
+        throw new Error("任务创建成功但未返回 task_id");
       }
 
-      // 6. Show results from OSS URLs
-      const data = await resp.json();
-      showResults(data);
-      appendLog(`重建完成：session=${data.session_id}`);
+      appendLog(`任务已创建：task_id=${taskId}`);
+      let lastStatus = "";
 
-      // 7. Pause task immediately
-      setStatus("重建完成，正在暂停任务...", "loading");
-      await tmPause();
-      paused = true;
-      setStatus("重建完成，任务已暂停。", "ok");
+      while (true) {
+        const taskResp = await loadTask(taskId);
+        const output = taskResp.output || {};
+        const status = output.task_status || "";
+        if (status !== lastStatus) {
+          appendLog(`任务状态：${status}${taskResp.message ? ` (${taskResp.message})` : ""}`);
+          lastStatus = status;
+        }
 
+        applyTaskStatus(output, taskResp.message || "");
+
+        if (status === "SUCCEEDED") {
+          showResults(output);
+          appendLog(`重建完成：session=${output.session_id || taskId}`);
+          break;
+        }
+
+        if (status === "FAILED") {
+          throw new Error(taskResp.message || "任务执行失败");
+        }
+
+        await sleep(config.pollMs);
+      }
     } catch (e) {
-      requestError = e;
       setStatus(`请求失败：${e.message}`, "error");
       appendLog(`出错：${e.message}`);
     } finally {
-      if (queueTimer) clearInterval(queueTimer);
-
-      // Always pause if we recovered but haven't paused yet
-      if (recovered && !paused) {
-        try {
-          await tmPause();
-          paused = true;
-          if (requestError) {
-            setStatus(`请求失败：${requestError.message}（任务已自动暂停）`, "error");
-          }
-        } catch (pe) {
-          if (requestError) {
-            setStatus(`请求失败：${requestError.message}；暂停失败：${pe.message}`, "error");
-          }
-        }
-      }
-
       reconstructBtn.disabled = false;
     }
   });
 
   // ---- Init ----
   appendLog(`任务管理器=${config.taskManager}`);
-  appendLog(`项目=${config.project}`);
+  appendLog(`模型=${config.model}`);
   appendLog("就绪。");
 })();
 </script>

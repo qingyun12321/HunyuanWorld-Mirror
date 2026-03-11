@@ -18,7 +18,6 @@ import subprocess
 import sys
 import time
 import uuid
-from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
@@ -99,56 +98,40 @@ def oss_sign_url(oss_key: str, expires: str = "1h") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reconstruction queue (concurrency=1, async FIFO)
+# Runtime single-flight state
 # ---------------------------------------------------------------------------
-class ReconstructionQueue:
-    """Async single-concurrency queue with status tracking."""
+class RuntimeSingleFlight:
+    """Single-flight runtime guard for one task per pod."""
 
     def __init__(self) -> None:
-        self._sem = asyncio.Semaphore(1)
         self._lock = Lock()
-        self._processing_id: str | None = None
-        self._pending: OrderedDict[str, int] = OrderedDict()
-        self._position_counter = 0
+        self._current_request_id: str | None = None
 
-    def register(self, request_id: str) -> None:
+    def try_acquire(self, request_id: str) -> bool:
         with self._lock:
-            self._position_counter += 1
-            self._pending[request_id] = self._position_counter
-
-    def set_processing(self, request_id: str) -> None:
-        with self._lock:
-            self._pending.pop(request_id, None)
-            self._processing_id = request_id
+            if self._current_request_id is not None:
+                return False
+            self._current_request_id = request_id
+            return True
 
     def finish(self, request_id: str) -> None:
         with self._lock:
-            if self._processing_id == request_id:
-                self._processing_id = None
-            self._pending.pop(request_id, None)
+            if self._current_request_id == request_id:
+                self._current_request_id = None
 
     def status(self, request_id: str | None = None) -> dict:
         with self._lock:
-            pending_count = len(self._pending)
-            processing = self._processing_id is not None
-
-            if request_id:
-                if self._processing_id == request_id:
-                    return {"processing": True, "pending": pending_count,
-                            "status": "processing", "position": 0}
-                if request_id in self._pending:
-                    pos = list(self._pending.keys()).index(request_id) + 1
-                    return {"processing": processing, "pending": pending_count,
-                            "status": "pending", "position": pos}
-                return {"processing": processing, "pending": pending_count,
-                        "status": "idle", "position": -1}
-
-            return {"processing": processing, "pending": pending_count,
-                    "status": "processing" if processing else ("pending" if pending_count else "idle"),
-                    "position": 0}
+            busy = self._current_request_id is not None
+            status = "processing" if busy else "idle"
+            return {
+                "busy": busy,
+                "status": status,
+                "request_id": self._current_request_id,
+                "matches": bool(request_id and request_id == self._current_request_id),
+            }
 
 
-QUEUE = ReconstructionQueue()
+RUNTIME_STATE = RuntimeSingleFlight()
 
 # ---------------------------------------------------------------------------
 # Global model state
@@ -529,7 +512,7 @@ def health_check():
 
 @app.get("/queue_status")
 def queue_status(request_id: str | None = None):
-    return QUEUE.status(request_id)
+    return RUNTIME_STATE.status(request_id)
 
 
 @app.post("/reconstruct")
@@ -544,18 +527,17 @@ async def reconstruct(
     request_id: str = Form(default=""),
 ):
     request_id = request_id.strip() or uuid.uuid4().hex
-    QUEUE.register(request_id)
+    if not RUNTIME_STATE.try_acquire(request_id):
+        raise HTTPException(status_code=503, detail="node busy")
 
     try:
-        async with QUEUE._sem:
-            QUEUE.set_processing(request_id)
-            return await _do_reconstruct(
-                files, time_interval, frame_selector,
-                show_camera, show_mesh, filter_sky_bg, filter_ambiguous,
-                request_id,
-            )
+        return await _do_reconstruct(
+            files, time_interval, frame_selector,
+            show_camera, show_mesh, filter_sky_bg, filter_ambiguous,
+            request_id,
+        )
     finally:
-        QUEUE.finish(request_id)
+        RUNTIME_STATE.finish(request_id)
 
 
 async def _do_reconstruct(
