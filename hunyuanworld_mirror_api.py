@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import gc
 import io
+import logging
 import os
 import shutil
 import subprocess
@@ -20,7 +21,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any
 
 import cv2
@@ -29,12 +30,20 @@ import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from lightning_utilities.core.rank_zero import rank_zero_only
 from PIL import Image
 from pillow_heif import register_heif_opener
 
 register_heif_opener()
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+LOG_LEVEL = os.getenv("KOKONI_LOG_LEVEL", "INFO")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s [runtime] %(message)s",
+)
+logger = logging.getLogger("runtime")
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 CKPTS_DIR = os.path.join(PROJECT_ROOT, "ckpts")
@@ -137,6 +146,79 @@ RUNTIME_STATE = RuntimeSingleFlight()
 # Global model state
 # ---------------------------------------------------------------------------
 model = None
+MODEL_LOAD_LOCK = Lock()
+MODEL_STATUS_LOCK = Lock()
+MODEL_STATUS: dict[str, str] = {
+    "status": "starting",
+    "message": "Runtime is initializing.",
+}
+
+
+def _set_model_status(status: str, message: str = "") -> None:
+    with MODEL_STATUS_LOCK:
+        MODEL_STATUS["status"] = status
+        MODEL_STATUS["message"] = message
+    logger.info("model status changed: %s (%s)", status, message or "no-message")
+
+
+def _get_model_status() -> dict[str, str]:
+    with MODEL_STATUS_LOCK:
+        return dict(MODEL_STATUS)
+
+
+def _ensure_rank_zero_initialized() -> None:
+    if getattr(rank_zero_only, "rank", None) is None:
+        rank_zero_only.rank = 0
+        logger.info("initialized rank_zero_only.rank=0 for inference runtime")
+
+
+def _ensure_model_loaded() -> None:
+    global model
+
+    from src.models.models.worldmirror import WorldMirror
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if model is None:
+        with MODEL_LOAD_LOCK:
+            if model is None:
+                _ensure_rank_zero_initialized()
+                _set_model_status("loading", "Loading model weights.")
+                required = ["config.json", "model.safetensors"]
+                missing = [f for f in required if not os.path.exists(os.path.join(LOCAL_MODEL_DIR, f))]
+                if missing:
+                    from huggingface_hub import snapshot_download
+                    snapshot_download(
+                        repo_id="tencent/HunyuanWorld-Mirror",
+                        local_dir=LOCAL_MODEL_DIR,
+                        local_dir_use_symlinks=False,
+                        allow_patterns=required,
+                    )
+                model = WorldMirror.from_pretrained(LOCAL_MODEL_DIR).to(device)
+                model.eval()
+                _set_model_status("ready", "Model is ready.")
+    else:
+        model.to(device)
+        model.eval()
+        _set_model_status("ready", "Model is ready.")
+
+
+def _startup_preload() -> None:
+    try:
+        logger.info("startup preload begins")
+        _ensure_model_loaded()
+        logger.info("startup preload finished")
+    except Exception as exc:  # pragma: no cover - startup environment dependent
+        _set_model_status("error", str(exc))
+        logger.exception("startup preload failed")
+
+
+def _health_payload() -> dict[str, Any]:
+    state = _get_model_status()
+    return {
+        "status": "ok" if state["status"] == "ready" else state["status"],
+        "model_ready": state["status"] == "ready",
+        "message": state["message"],
+    }
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -149,6 +231,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def startup_event():
+    logger.info("runtime startup event triggered")
+    Thread(target=_startup_preload, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -227,25 +315,11 @@ def run_model(
     """Run WorldMirror model and return (outputs, processed_data)."""
     global model
 
-    from src.models.models.worldmirror import WorldMirror
     from src.models.utils.geometry import depth_to_world_coords_points
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if model is None:
-        required = ["config.json", "model.safetensors"]
-        missing = [f for f in required if not os.path.exists(os.path.join(LOCAL_MODEL_DIR, f))]
-        if missing:
-            from huggingface_hub import snapshot_download
-            snapshot_download(
-                repo_id="tencent/HunyuanWorld-Mirror",
-                local_dir=LOCAL_MODEL_DIR,
-                local_dir_use_symlinks=False,
-                allow_patterns=required,
-            )
-        model = WorldMirror.from_pretrained(LOCAL_MODEL_DIR).to(device)
-    else:
-        model.to(device)
+    _ensure_model_loaded()
+    model.to(device)
     model.eval()
 
     image_folder = os.path.join(target_dir, "images")
@@ -507,6 +581,20 @@ def generate_and_upload_results(
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health_check():
+    payload = _health_payload()
+    status_code = 200 if payload["model_ready"] else 503
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@app.get("/ready")
+def ready_check():
+    payload = _health_payload()
+    status_code = 200 if payload["model_ready"] else 503
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@app.get("/live")
+def live_check():
     return {"status": "ok"}
 
 
@@ -528,15 +616,18 @@ async def reconstruct(
 ):
     request_id = request_id.strip() or uuid.uuid4().hex
     if not RUNTIME_STATE.try_acquire(request_id):
+        logger.info("reject busy request request_id=%s", request_id)
         raise HTTPException(status_code=503, detail="node busy")
 
     try:
+        logger.info("accepted reconstruct request request_id=%s", request_id)
         return await _do_reconstruct(
             files, time_interval, frame_selector,
             show_camera, show_mesh, filter_sky_bg, filter_ambiguous,
             request_id,
         )
     finally:
+        logger.info("finished reconstruct request request_id=%s", request_id)
         RUNTIME_STATE.finish(request_id)
 
 
