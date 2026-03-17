@@ -873,7 +873,7 @@
       throw new Error(`恢复失败：${detail}`);
     }
     const data = await resp.json();
-    appendLog(`恢复完成：recovered=${data.recovered}, url=${data.service_url}`);
+    appendLog("恢复完成。");
     return data;
   };
 
@@ -1096,7 +1096,7 @@
       // 2. Wait for GPU backend /health
       setStatus("等待 GPU 后端就绪...", "loading");
       await waitForHealth(runtimeApiBase);
-      appendLog("后端已就绪：" + runtimeApiBase);
+      appendLog("后端已就绪。");
 
       // 3. Build FormData
       const requestId = crypto.randomUUID
@@ -1149,7 +1149,7 @@
       // 6. Show results from OSS URLs
       const data = await resp.json();
       showResults(data);
-      appendLog(`重建完成：session=${data.session_id}`);
+      appendLog("重建完成。");
 
       // 7. Pause task immediately
       setStatus("重建完成，正在暂停任务...", "loading");
@@ -1184,8 +1184,6 @@
   });
 
   // ---- Init ----
-  appendLog(`任务管理器=${config.taskManager}`);
-  appendLog(`项目=${config.project}`);
   appendLog("就绪。");
 })();
 </script>
