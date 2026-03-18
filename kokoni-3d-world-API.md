@@ -14,7 +14,7 @@
 当前服务地址（下文中的 `base_url`）：
 
 ```text
-http://36.133.236.108:8090
+http://36.133.236.108:8091
 ```
 
 ## 3. 鉴权
@@ -37,7 +37,7 @@ API 使用 **Bearer Token** 机制进行访问控制。客户端需要在 Header
 ### 4.1 请求地址
 
 ```text
-POST http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstruction
+POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstruction
 ```
 
 ### 4.2 请求类型
@@ -100,7 +100,7 @@ POST http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstructio
 ### 4.5 请求示例
 
 ```bash
-curl --location 'http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/reconstruction' \
+curl --location 'http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstruction' \
   -H 'Authorization: Bearer <YOUR_API_KEY>' \
   -F 'request={
     "model":"kokoni-3d-world",
@@ -141,7 +141,7 @@ curl --location 'http://36.133.236.108:8090/api/v1/services/aigc/3d-generation/r
 ### 5.1 请求地址
 
 ```text
-GET http://36.133.236.108:8090/api/v1/tasks/{task_id}
+GET http://36.133.236.108:8091/api/v1/tasks/{task_id}
 ```
 
 ### 5.2 路径参数
@@ -201,7 +201,7 @@ GET http://36.133.236.108:8090/api/v1/tasks/{task_id}
 ### 5.5 查询示例
 
 ```bash
-curl --location 'http://36.133.236.108:8090/api/v1/tasks/7d7d5167b6d4498ebad79dc58e11e4f7' \
+curl --location 'http://36.133.236.108:8091/api/v1/tasks/7d7d5167b6d4498ebad79dc58e11e4f7' \
   -H 'Authorization: Bearer <YOUR_API_KEY>'
 ```
 
