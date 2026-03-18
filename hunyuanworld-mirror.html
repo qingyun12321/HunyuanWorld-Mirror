@@ -930,12 +930,25 @@
   const applyTaskStatus = (output, message = "") => {
     if (!output) return;
     const status = output.task_status;
+    const runtimeStatus = output.runtime_task_status || "";
+    const queuePosition = Number.isFinite(output.runtime_queue_position)
+      ? output.runtime_queue_position
+      : null;
     if (status === "PENDING") {
-      setStatus("等待可用节点...", "loading");
+      setStatus(message || "等待排队或可用节点...", "loading");
     } else if (status === "SCALING") {
       setStatus(message || "正在扩容并等待节点冷启动...", "loading");
     } else if (status === "RUNNING") {
-      setStatus("重建中，请保持页面开启。", "loading");
+      if (runtimeStatus === "PENDING") {
+        const queueText = queuePosition && queuePosition > 0
+          ? `运行时队列中，排队位置 ${queuePosition}...`
+          : "运行时队列中，等待执行..."
+        setStatus(queueText, "loading");
+      } else if (runtimeStatus === "RUNNING") {
+        setStatus("正在执行 3D 重建，请保持页面开启。", "loading");
+      } else {
+        setStatus("重建中，请保持页面开启。", "loading");
+      }
     } else if (status === "SUCCEEDED") {
       setStatus("重建完成。", "ok");
     } else if (status === "FAILED") {
@@ -1115,14 +1128,35 @@
 
       appendLog(`任务已创建：task_id=${taskId}`);
       let lastStatus = "";
+      let lastRuntimeStatus = "";
+      let lastQueuePosition = null;
 
       while (true) {
         const taskResp = await loadTask(taskId);
         const output = taskResp.output || {};
         const status = output.task_status || "";
+        const runtimeStatus = output.runtime_task_status || "";
+        const queuePosition = Number.isFinite(output.runtime_queue_position)
+          ? output.runtime_queue_position
+          : null;
         if (status !== lastStatus) {
           appendLog(`任务状态：${status}${taskResp.message ? ` (${taskResp.message})` : ""}`);
           lastStatus = status;
+        }
+        if (runtimeStatus && (runtimeStatus !== lastRuntimeStatus || queuePosition !== lastQueuePosition)) {
+          if (runtimeStatus === "PENDING") {
+            appendLog(
+              queuePosition && queuePosition > 0
+                ? `运行时状态：排队中（位置 ${queuePosition}）`
+                : "运行时状态：排队中",
+            );
+          } else if (runtimeStatus === "RUNNING") {
+            appendLog("运行时状态：处理中");
+          } else {
+            appendLog(`运行时状态：${runtimeStatus}`);
+          }
+          lastRuntimeStatus = runtimeStatus;
+          lastQueuePosition = queuePosition;
         }
 
         applyTaskStatus(output, taskResp.message || "");

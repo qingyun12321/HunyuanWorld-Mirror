@@ -19,9 +19,10 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Condition, Lock, Thread
 from typing import Any
 
 import cv2
@@ -107,40 +108,166 @@ def oss_sign_url(oss_key: str, expires: str = "1h") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Runtime single-flight state
+# Runtime queue state
 # ---------------------------------------------------------------------------
-class RuntimeSingleFlight:
-    """Single-flight runtime guard for one task per pod."""
+TASK_QUEUE_MAXSIZE = max(int(os.getenv("TASK_QUEUE_MAXSIZE", "8")), 1)
 
-    def __init__(self) -> None:
-        self._lock = Lock()
-        self._current_request_id: str | None = None
 
-    def try_acquire(self, request_id: str) -> bool:
-        with self._lock:
-            if self._current_request_id is not None:
-                return False
-            self._current_request_id = request_id
-            return True
+@dataclass
+class RequestRecord:
+    status: str
+    created_at: float = field(default_factory=time.time)
+    error: str = ""
+    started_at: float | None = None
+    finished_at: float | None = None
+    result: dict[str, Any] = field(default_factory=dict)
 
-    def finish(self, request_id: str) -> None:
-        with self._lock:
-            if self._current_request_id == request_id:
-                self._current_request_id = None
 
-    def status(self, request_id: str | None = None) -> dict:
-        with self._lock:
-            busy = self._current_request_id is not None
-            status = "processing" if busy else "idle"
-            return {
-                "busy": busy,
-                "status": status,
-                "request_id": self._current_request_id,
-                "matches": bool(request_id and request_id == self._current_request_id),
+class ConcurrentTaskQueue:
+    """Single-worker runtime queue with inspectable request status."""
+
+    def __init__(self, *, maxsize: int = TASK_QUEUE_MAXSIZE) -> None:
+        self._cond = Condition()
+        self._pending: list[tuple[str, Any]] = []
+        self._active_request_ids: set[str] = set()
+        self._records: dict[str, RequestRecord] = {}
+        self._workers: list[Thread] = []
+        self._running = False
+        self._maxsize = max(1, int(maxsize or 1))
+
+    def start(self, handler: Any, *, worker_count: int = 1) -> None:
+        with self._cond:
+            if any(worker.is_alive() for worker in self._workers):
+                return
+            self._running = True
+            self._workers = []
+            total = max(1, int(worker_count or 1))
+            for index in range(total):
+                worker = Thread(
+                    target=self._worker_loop,
+                    args=(handler,),
+                    daemon=True,
+                    name=f"hunyuanworld-runtime-worker-{index}",
+                )
+                self._workers.append(worker)
+                worker.start()
+
+    def enqueue(
+        self,
+        payload: Any,
+        *,
+        request_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[str, int]:
+        rid = (request_id or "").strip() or uuid.uuid4().hex
+        initial_meta = dict(metadata or {})
+
+        with self._cond:
+            record = self._records.get(rid)
+            if record and record.status in {"pending", "processing"}:
+                raise ValueError("request_id already exists in queue")
+            active_count = len(self._pending) + len(self._active_request_ids)
+            if active_count >= self._maxsize:
+                raise OverflowError("queue is full")
+
+            self._records[rid] = RequestRecord(status="pending", result=initial_meta)
+            self._pending.append((rid, payload))
+            position = self._pending_position_unlocked(rid)
+            self._cond.notify()
+            return rid, position
+
+    def get_queue_status(self, request_id: str | None = None) -> dict[str, Any]:
+        with self._cond:
+            active_request_ids = sorted(self._active_request_ids)
+            payload: dict[str, Any] = {
+                "processing": bool(active_request_ids),
+                "processing_count": len(active_request_ids),
+                "pending": len(self._pending),
+                "current_request_id": active_request_ids[0] if active_request_ids else "",
+                "processing_request_ids": active_request_ids,
             }
+            if request_id is not None:
+                rid = request_id.strip()
+                payload["status"] = self._records[rid].status if rid in self._records else "unknown"
+                payload["position"] = self._position_for_request_unlocked(rid)
+            else:
+                payload["status"] = (
+                    "processing" if active_request_ids else ("pending" if self._pending else "idle")
+                )
+            return payload
+
+    def get_request_status(self, request_id: str) -> dict[str, Any] | None:
+        rid = request_id.strip()
+        with self._cond:
+            record = self._records.get(rid)
+            if not record:
+                return None
+            result = dict(record.result)
+            payload: dict[str, Any] = {
+                "request_id": rid,
+                "status": record.status,
+                "error": record.error,
+                "created_at": record.created_at,
+                "started_at": record.started_at,
+                "finished_at": record.finished_at,
+                "result": result,
+            }
+            if record.status == "pending":
+                payload["position"] = self._pending_position_unlocked(rid)
+            for key, value in result.items():
+                if key not in payload:
+                    payload[key] = value
+            return payload
+
+    def _worker_loop(self, handler: Any) -> None:
+        while True:
+            with self._cond:
+                while self._running and not self._pending:
+                    self._cond.wait()
+                if not self._running:
+                    return
+                request_id, payload = self._pending.pop(0)
+                self._active_request_ids.add(request_id)
+                record = self._records[request_id]
+                record.status = "processing"
+                record.error = ""
+                record.started_at = time.time()
+
+            try:
+                result = handler(request_id, payload) or {}
+                with self._cond:
+                    record = self._records[request_id]
+                    record.status = "completed"
+                    record.finished_at = time.time()
+                    if isinstance(result, dict):
+                        merged = dict(record.result)
+                        merged.update(result)
+                        record.result = merged
+            except Exception as exc:  # pragma: no cover - exercised via API surface
+                with self._cond:
+                    record = self._records[request_id]
+                    record.status = "failed"
+                    record.error = str(exc)
+                    record.finished_at = time.time()
+            finally:
+                with self._cond:
+                    self._active_request_ids.discard(request_id)
+
+    def _position_for_request_unlocked(self, request_id: str) -> int:
+        if not request_id:
+            return -1
+        if request_id in self._active_request_ids:
+            return 0
+        return self._pending_position_unlocked(request_id)
+
+    def _pending_position_unlocked(self, request_id: str) -> int:
+        for index, (rid, _payload) in enumerate(self._pending):
+            if rid == request_id:
+                return index + 1
+        return -1
 
 
-RUNTIME_STATE = RuntimeSingleFlight()
+RUN_QUEUE = ConcurrentTaskQueue()
 
 # ---------------------------------------------------------------------------
 # Global model state
@@ -220,6 +347,13 @@ def _health_payload() -> dict[str, Any]:
         "message": state["message"],
     }
 
+
+def _require_runtime_ready() -> None:
+    payload = _health_payload()
+    if payload["model_ready"]:
+        return
+    raise HTTPException(status_code=503, detail=payload["message"] or "Runtime is not ready.")
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -236,6 +370,7 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_event():
     logger.info("runtime startup event triggered")
+    RUN_QUEUE.start(_execute_run_request)
     Thread(target=_startup_preload, daemon=True).start()
 
 
@@ -600,7 +735,131 @@ def live_check():
 
 @app.get("/queue_status")
 def queue_status(request_id: str | None = None):
-    return RUNTIME_STATE.status(request_id)
+    rid = request_id.strip() if request_id else None
+    return RUN_QUEUE.get_queue_status(rid if rid else None)
+
+
+@app.get("/request_status")
+def request_status(request_id: str):
+    rid = request_id.strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    payload = RUN_QUEUE.get_request_status(rid)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="request_id not found")
+    return payload
+
+
+async def _read_upload_payloads(files: list[UploadFile]) -> list[dict[str, Any]]:
+    uploads: list[dict[str, Any]] = []
+    for upload in files:
+        content = await upload.read()
+        if not content:
+            continue
+        uploads.append(
+            {
+                "filename": upload.filename or "upload.bin",
+                "content_type": upload.content_type or "application/octet-stream",
+                "content": content,
+            }
+        )
+    return uploads
+
+
+def _build_queue_payload(
+    upload_payloads: list[dict[str, Any]],
+    *,
+    time_interval: float,
+    frame_selector: str,
+    show_camera: bool,
+    show_mesh: bool,
+    filter_sky_bg: bool,
+    filter_ambiguous: bool,
+) -> dict[str, Any]:
+    return {
+        "files": upload_payloads,
+        "time_interval": float(time_interval),
+        "frame_selector": frame_selector,
+        "show_camera": bool(show_camera),
+        "show_mesh": bool(show_mesh),
+        "filter_sky_bg": bool(filter_sky_bg),
+        "filter_ambiguous": bool(filter_ambiguous),
+    }
+
+
+def _execute_run_request(request_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return _process_reconstruct_request(
+        upload_payloads=payload.get("files") or [],
+        time_interval=float(payload.get("time_interval", 1.0)),
+        frame_selector=str(payload.get("frame_selector") or "All"),
+        show_camera=bool(payload.get("show_camera", True)),
+        show_mesh=bool(payload.get("show_mesh", True)),
+        filter_sky_bg=bool(payload.get("filter_sky_bg", False)),
+        filter_ambiguous=bool(payload.get("filter_ambiguous", True)),
+        request_id=request_id,
+    )
+
+
+def _enqueue_request(
+    upload_payloads: list[dict[str, Any]],
+    *,
+    time_interval: float,
+    frame_selector: str,
+    show_camera: bool,
+    show_mesh: bool,
+    filter_sky_bg: bool,
+    filter_ambiguous: bool,
+    request_id: str = "",
+) -> dict[str, Any]:
+    _require_runtime_ready()
+    if not upload_payloads:
+        raise HTTPException(status_code=400, detail="At least one file is required.")
+    try:
+        request_id_out, position = RUN_QUEUE.enqueue(
+            _build_queue_payload(
+                upload_payloads,
+                time_interval=time_interval,
+                frame_selector=frame_selector,
+                show_camera=show_camera,
+                show_mesh=show_mesh,
+                filter_sky_bg=filter_sky_bg,
+                filter_ambiguous=filter_ambiguous,
+            ),
+            request_id=request_id or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OverflowError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    return {
+        "status": "queued",
+        "request_id": request_id_out,
+        "position": position,
+    }
+
+
+@app.post("/run_with_files")
+async def run_with_files(
+    files: list[UploadFile] = File(...),
+    time_interval: float = Form(default=1.0),
+    frame_selector: str = Form(default="All"),
+    show_camera: bool = Form(default=True),
+    show_mesh: bool = Form(default=True),
+    filter_sky_bg: bool = Form(default=False),
+    filter_ambiguous: bool = Form(default=True),
+    request_id: str = Form(default=""),
+):
+    upload_payloads = await _read_upload_payloads(files)
+    return _enqueue_request(
+        upload_payloads,
+        time_interval=time_interval,
+        frame_selector=frame_selector,
+        show_camera=show_camera,
+        show_mesh=show_mesh,
+        filter_sky_bg=filter_sky_bg,
+        filter_ambiguous=filter_ambiguous,
+        request_id=request_id.strip(),
+    )
 
 
 @app.post("/reconstruct")
@@ -614,25 +873,21 @@ async def reconstruct(
     filter_ambiguous: bool = Form(default=True),
     request_id: str = Form(default=""),
 ):
-    request_id = request_id.strip() or uuid.uuid4().hex
-    if not RUNTIME_STATE.try_acquire(request_id):
-        logger.info("reject busy request request_id=%s", request_id)
-        raise HTTPException(status_code=503, detail="node busy")
-
-    try:
-        logger.info("accepted reconstruct request request_id=%s", request_id)
-        return await _do_reconstruct(
-            files, time_interval, frame_selector,
-            show_camera, show_mesh, filter_sky_bg, filter_ambiguous,
-            request_id,
-        )
-    finally:
-        logger.info("finished reconstruct request request_id=%s", request_id)
-        RUNTIME_STATE.finish(request_id)
+    return await run_with_files(
+        files=files,
+        time_interval=time_interval,
+        frame_selector=frame_selector,
+        show_camera=show_camera,
+        show_mesh=show_mesh,
+        filter_sky_bg=filter_sky_bg,
+        filter_ambiguous=filter_ambiguous,
+        request_id=request_id,
+    )
 
 
-async def _do_reconstruct(
-    files: list[UploadFile],
+def _process_reconstruct_request(
+    *,
+    upload_payloads: list[dict[str, Any]],
     time_interval: float,
     frame_selector: str,
     show_camera: bool,
@@ -651,13 +906,12 @@ async def _do_reconstruct(
         os.makedirs(upload_dir, exist_ok=True)
 
         saved_paths: list[str] = []
-        for f in files:
-            ext = os.path.splitext(f.filename or "")[1] or ".png"
+        for upload in upload_payloads:
+            ext = os.path.splitext(upload.get("filename") or "")[1] or ".png"
             name = f"{uuid.uuid4().hex}{ext}"
             path = os.path.join(upload_dir, name)
-            content = await f.read()
             with open(path, "wb") as fp:
-                fp.write(content)
+                fp.write(upload["content"])
             saved_paths.append(path)
 
         print(f"[reconstruct] Processing {len(saved_paths)} files, session={session_id}")
@@ -665,28 +919,20 @@ async def _do_reconstruct(
         gc.collect()
         torch.cuda.empty_cache()
 
-        image_paths = await asyncio.get_event_loop().run_in_executor(
-            None, process_uploaded_files, saved_paths, target_dir, time_interval,
-        )
+        image_paths = process_uploaded_files(saved_paths, target_dir, time_interval)
 
         if not image_paths:
             raise HTTPException(status_code=400, detail="No valid images after processing.")
 
         oss_input_dir = f"{OSS_PREFIX}/{session_id}/input"
-        await asyncio.get_event_loop().run_in_executor(
-            None, oss_upload_dir, os.path.join(target_dir, "images"), oss_input_dir + "/images/",
-        )
+        oss_upload_dir(os.path.join(target_dir, "images"), oss_input_dir + "/images/")
 
         print(f"[reconstruct] Running WorldMirror inference...")
         with torch.no_grad():
-            outputs, processed_data = await asyncio.get_event_loop().run_in_executor(
-                None, run_model, target_dir,
-            )
+            outputs, processed_data = run_model(target_dir)
 
         print(f"[reconstruct] Generating and uploading results...")
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            generate_and_upload_results,
+        result = generate_and_upload_results(
             target_dir, outputs, processed_data, session_id,
             frame_selector, show_camera, show_mesh, filter_sky_bg, filter_ambiguous,
         )
@@ -698,11 +944,11 @@ async def _do_reconstruct(
         print(f"[reconstruct] Done. session={session_id}")
         return result
 
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+        raise RuntimeError(str(exc.detail)) from exc
     except Exception as e:
         print(f"[reconstruct] Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Reconstruction failed: {e}")
+        raise RuntimeError(f"Reconstruction failed: {e}") from e
     finally:
         if os.path.isdir(target_dir):
             shutil.rmtree(target_dir, ignore_errors=True)
