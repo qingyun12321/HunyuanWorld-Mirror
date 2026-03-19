@@ -11,7 +11,7 @@
 
 ## 2. 服务地址
 
-当前服务地址（下文中的 `base_url`）：
+当前公共 API 服务地址（下文中的 `base_url`）：
 
 ```text
 http://36.133.236.108:8091
@@ -34,26 +34,26 @@ API 使用 **Bearer Token** 机制进行访问控制。客户端需要在 Header
 
 ## 5. 创建重建任务
 
-### 4.1 请求地址
+### 5.1 请求地址
 
 ```text
 POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstruction
 ```
 
-### 4.2 请求类型
+### 5.2 请求类型
 
 `multipart/form-data`
 
-### 4.3 请求参数
+### 5.3 请求参数
 
 表单中包含两个部分：
 
 | 参数名 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `request` | string | 是 | JSON 字符串，外层结构固定为 `model / input / parameters` |
+| `request` | string | 是 | JSON 字符串，外层结构为 `model / input / parameters`，其中 `input` 与 `parameters` 可按需省略 |
 | `files` | file[] | 是 | 待重建的图片或视频文件，可多文件上传 |
 
-### 4.4 `request` 字段说明
+### 5.4 `request` 字段说明
 
 ```json
 {
@@ -77,8 +77,8 @@ POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstructio
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `model` | string | 是 | 模型名称，当前使用 `kokoni-3d-world` |
-| `input` | object | 是 | 输入参数 |
-| `parameters` | object | 是 | 控制参数 |
+| `input` | object | 否 | 输入参数；不传时使用默认行为 |
+| `parameters` | object | 否 | 控制参数；不传时使用默认值 |
 
 #### `input` 字段
 
@@ -97,7 +97,7 @@ POST http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstructio
 | `filter_sky_bg` | boolean | 否 | `false` | 是否过滤天空背景 |
 | `filter_ambiguous` | boolean | 否 | `true` | 是否过滤低置信度区域 |
 
-### 4.5 请求示例
+### 5.5 请求示例
 
 ```bash
 curl --location 'http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/reconstruction' \
@@ -120,7 +120,7 @@ curl --location 'http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/r
   -F 'files=@/path/to/video1.mp4'
 ```
 
-### 4.6 成功响应示例
+### 5.6 成功响应示例
 
 ```json
 {
@@ -138,19 +138,19 @@ curl --location 'http://36.133.236.108:8091/api/v1/services/aigc/3d-generation/r
 
 ## 6. 查询任务状态
 
-### 5.1 请求地址
+### 6.1 请求地址
 
 ```text
 GET http://36.133.236.108:8091/api/v1/tasks/{task_id}
 ```
 
-### 5.2 路径参数
+### 6.2 路径参数
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `task_id` | string | 是 | 创建任务接口返回的任务 ID |
 
-### 5.3 任务状态说明
+### 6.3 任务状态说明
 
 | 状态 | 说明 |
 |---|---|
@@ -160,7 +160,7 @@ GET http://36.133.236.108:8091/api/v1/tasks/{task_id}
 | `SUCCEEDED` | 任务完成，可读取结果 |
 | `FAILED` | 任务失败，请查看 `message` |
 
-### 5.4 查询响应字段
+### 6.4 查询响应字段
 
 响应根级字段固定如下：
 
@@ -183,6 +183,11 @@ GET http://36.133.236.108:8091/api/v1/tasks/{task_id}
 | `start_time` | string \| null | 开始执行时间 |
 | `end_time` | string \| null | 结束时间 |
 
+说明：
+
+- 调用方应只依赖本文档列出的稳定公共字段。
+- 接口在部分阶段可能附带额外辅助字段，这些字段不属于公共契约，调用方可忽略。
+
 任务成功后，`output` 中还会包含以下结果字段：
 
 | 字段 | 类型 | 说明 |
@@ -198,14 +203,14 @@ GET http://36.133.236.108:8091/api/v1/tasks/{task_id}
 | `rgb_video_url` | string \| null | 渲染 RGB 视频地址 |
 | `depth_video_url` | string \| null | 渲染深度视频地址 |
 
-### 5.5 查询示例
+### 6.5 查询示例
 
 ```bash
 curl --location 'http://36.133.236.108:8091/api/v1/tasks/7d7d5167b6d4498ebad79dc58e11e4f7' \
   -H 'Authorization: Bearer <YOUR_API_KEY>'
 ```
 
-### 5.6 成功完成响应示例
+### 6.6 成功完成响应示例
 
 ```json
 {
@@ -263,5 +268,3 @@ curl --location 'http://36.133.236.108:8091/api/v1/tasks/7d7d5167b6d4498ebad79dc
 - `ply_url`：点云/高斯泼溅资产下载
 - `depth_urls` / `normal_urls`：可视化结果展示
 - `rgb_video_url` / `depth_video_url`：视频回放与结果演示
-
-建议在业务侧自行管理下载、缓存和过期策略。

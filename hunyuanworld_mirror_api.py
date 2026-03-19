@@ -1,5 +1,5 @@
 """
-HunyuanWorld-Mirror GPU Backend API
+kokoni-3d-world GPU Backend API
 
 Pure FastAPI server that handles 3D reconstruction requests.
 All platform task management lives in suanli-task-manager; this backend
@@ -69,7 +69,7 @@ import onnxruntime
 # OSS helpers
 # ---------------------------------------------------------------------------
 OSS_BUCKET = "kokokoni"
-OSS_PREFIX = "docker-input&output/hunyuanworld-mirror"
+OSS_PREFIX = os.getenv("KOKONI_OSS_PREFIX", "docker-input&output/kokoni-3d-world").strip("/")
 
 
 def oss_upload(local_path: str, oss_key: str) -> None:
@@ -357,7 +357,7 @@ def _require_runtime_ready() -> None:
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
-app = FastAPI(title="HunyuanWorld-Mirror API", version="1.0.0")
+app = FastAPI(title="kokoni-3d-world API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -958,7 +958,7 @@ def _process_reconstruct_request(
 # Entry point
 # ---------------------------------------------------------------------------
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HunyuanWorld-Mirror API")
+    parser = argparse.ArgumentParser(description="kokoni-3d-world API")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=10085)
     return parser.parse_args()
